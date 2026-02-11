@@ -21,6 +21,7 @@ import (
 	"log"
 	"os"
 	"pcap_agent/internal/prompts"
+	conversationsummary "pcap_agent/internal/summary"
 	"pcap_agent/internal/tools"
 	"pcap_agent/internal/virtual_env"
 	"time"
@@ -81,7 +82,17 @@ func main() {
 		log.Fatal(err)
 	}
 
+	sumMW, err := conversationsummary.New(ctx, &conversationsummary.Config{
+		Model:                      arkModel,
+		MaxTokensBeforeSummary:     15 * 1024, // Trigger at 10K tokens for demo
+		MaxTokensForRecentMessages: 4 * 1024,  // Keep 2K tokens of recent messages
+	})
+	if err != nil {
+		logger.Fatalf("create summarization middleware failed, err=%v", err)
+	}
+
 	rAgent, err := react.NewAgent(ctx, &react.AgentConfig{
+		MessageRewriter:  sumMW.MessageModifier,
 		ToolCallingModel: arkModel,
 		ToolsConfig: compose.ToolsNodeConfig{
 			Tools: []tool.BaseTool{bash, sre},
@@ -109,7 +120,7 @@ func main() {
 
 	opt := []agent.AgentOption{
 		//agent.WithComposeOptions(compose.WithCallbacks(&logger.PrettyLoggerCallback{})), // 使用美观的 logger
-		agent.WithComposeOptions(compose.WithCallbacks(&logger.LoggerCallback{})), // 原始 logger
+		agent.WithComposeOptions(compose.WithCallbacks(&logger.PrettyLoggerCallback{})), // 原始 logger
 	}
 
 	/*	// Export graph and compile with mermaid (non-critical path)
@@ -132,7 +143,7 @@ func main() {
 		},
 		{
 			Role:    schema.User,
-			Content: "分析/home/linuxbrew/pcaps/ 目录下的文件，告诉我tcp udp流量的数量及其元数据",
+			Content: "你是一个高级网络分析师，分析/home/linuxbrew/pcaps/目录下的文件，研究这个用户到底做了什么",
 		},
 	}, opt...)
 	if err != nil {

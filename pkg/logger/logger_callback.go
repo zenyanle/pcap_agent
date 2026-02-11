@@ -69,8 +69,8 @@ func (cb *PrettyLoggerCallback) OnStart(ctx context.Context, info *callbacks.Run
 		fmt.Printf("║ 工具响应: %d 个\n", len(toolMsgs))
 		for i, tm := range toolMsgs {
 			content := tm.Content
-			if len(content) > 80 {
-				content = content[:80] + "..."
+			if len(content) > 500 {
+				content = content[:500] + "..."
 			}
 			fmt.Printf("║   %d. %s\n", i+1, content)
 		}
