@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"pcap_agent/internal/prompts"
 	"pcap_agent/pkg/logger"
 	"strings"
 
@@ -22,9 +23,14 @@ func New(ctx context.Context, cfg *Config) (*SummaryMiddleware, error) {
 		return nil, err
 	}
 
+	sumMd, err := prompts.GetSinglePrompt("sum")
+	if err != nil {
+		return nil, err
+	}
+
 	systemPrompt := cfg.SystemPrompt
 	if systemPrompt == "" {
-		systemPrompt = PromptOfSummary
+		systemPrompt = sumMd
 	}
 	maxBefore := cfg.GetMaxTokensBeforeSummary()
 	maxRecent := cfg.GetMaxTokensForRecentMessages()

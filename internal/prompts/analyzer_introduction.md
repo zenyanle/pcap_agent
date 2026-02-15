@@ -1,58 +1,94 @@
-## 1. 环境概述 (System Context)
-这是一个基于 **Ubuntu 24.04** 的 Docker 容器，专用于网络流量分析 (PCAP) 和取证。
-- **系统架构**: Linux x86_64
-- **当前用户**: linuxbrew (非 root，但有无密码 sudo 权限)
-- **包管理器**: Homebrew (系统级), uv (Python 级)
-- **工作目录**: /data (建议将 PCAP 文件挂载至此目录)
-- **Python环境**: 虚拟环境已自动激活 (/home/linuxbrew/venv)
+# Network Forensics Sandbox: Context & Tools
 
-## 2. 常用工具指南 (Tool Usage)
+## 1. System Context
 
-### A. Tshark (Wireshark 命令行版)
-用于精确提取包信息或进行包过滤。
+You are operating within a specialized **Ubuntu 24.04 Docker container** designed for network traffic analysis and forensics.
 
-* **基本读取**:
-  tshark -r input.pcap
-* **应用过滤器 (显示过滤器)**:
-  tshark -r input.pcap -Y "http.request.method == POST"
-* **提取特定字段 (CSV格式)**:
-  tshark -r input.pcap -T fields -e frame.number -e ip.src -e ip.dst -e http.host
-* **统计分析**:
-  tshark -r input.pcap -q -z io,phs (协议分级统计)
+* **User**: `linuxbrew` (Non-root, passwordless `sudo` enabled).
+* **Workdir**: `/data` (Mount PCAPs here).
+* **Package Managers**: Homebrew (system), uv (Python).
+* **Python**: Virtualenv is auto-activated (`/home/linuxbrew/venv`). Libraries `scapy`, `pyshark`, `pandas` are pre-installed.
 
-### B. Zeek (原 Bro)
-用于将 PCAP 文件转换为结构化的日志文件 (conn.log, http.log, dns.log 等)。
+## 2. Primary Tool: pcapchu-scripts (Zeek + DuckDB)
 
-* **分析 PCAP 文件**:
-  zeek -r input.pcap
-  *(注意：这会在当前目录下生成大量 .log 文件)*
-* **查看连接日志**:
-  cat conn.log | zeek-cut id.orig_h id.resp_h service
-* **指定脚本策略**:
-  zeek -r input.pcap frameworks/files/extract-all-files (提取流量中的文件)
+**Use this FIRST for high-level behavioral analysis.** It converts PCAPs into a structured SQL database.
 
-### C. Python 分析库 (已预装)
-环境使用 uv 管理依赖，虚拟环境默认激活。直接运行 python 或 ipython 即可。
+### Workflow
 
-#### 1. Scapy (强大的包伪造与解析)
+1. **Init**: `pcapchu-scripts init <pcap>` (Ingests PCAP, runs Zeek & pkt2flow).
+2. **Meta**: `pcapchu-scripts meta` (Returns schema. **ALWAYS run first**).
+3. **Query**: `pcapchu-scripts query "<SQL>"` (Execute SQL).
+
+### Data Model
+
+* **Zeek Tables**: `conn`, `http`, `dns`, `files`, `ssl`, etc.
+* **Flow Index**: `flow_index` (Catalogue of raw PCAP slices per flow).
+
+### SQL Cheat Sheet (DuckDB)
+
+* **Baseline**: `SELECT "id.orig_h", service, count(*) as c FROM conn GROUP BY 1,2 ORDER BY c DESC LIMIT 10`
+* **HTTP/File Correlation**: `SELECT h.host, h.uri, f.mime_type, f.fuid FROM http h, files f WHERE list_contains(h.resp_fuids, f.fuid)`
+* **Find Raw PCAP (pkt2flow)**: `SELECT file_path FROM flow_index WHERE dst_ip = '1.2.3.4' AND dst_port = 80`
+* **Extracted Payloads**: `SELECT mime_type, extracted as path FROM files WHERE extracted IS NOT NULL`
+
+## 3. Secondary Tools: Packet-Level Forensics
+
+**Use these when SQL metadata is insufficient and you need deep packet inspection.**
+
+### A. Tshark (CLI Wireshark)
+
+* **Basic Read**: `tshark -r input.pcap`
+* **Display Filter**: `tshark -r input.pcap -Y "http.request.method == POST"`
+* **Extract Fields (CSV)**:
+```bash
+tshark -r input.pcap -T fields -e frame.number -e ip.src -e ip.dst -e http.host
+
+```
+
+
+* **Protocol Stats**: `tshark -r input.pcap -q -z io,phs`
+
+### B. Python (Scapy / PyShark)
+
+Run via `python` or `ipython`.
+
+**Snippet: Scapy (Packet Forging/Parsing)**
+
+```python
 from scapy.all import *
-# 读取 PCAP
 packets = rdpcap("input.pcap")
-# 查看摘要
 packets.summary()
-# 访问特定层 (例如提取 DNS 查询)
+# Extract DNS Queries
 for pkt in packets:
-if DNS in pkt and pkt[DNS].qr == 0:
-print(pkt[DNS].qd.qname)
+    if DNS in pkt and pkt[DNS].qr == 0:
+        print(pkt[DNS].qd.qname)
 
-#### 2. PyShark (Tshark 的 Python 封装)
+```
 
+**Snippet: PyShark (Tshark Wrapper)**
+
+```python
 import pyshark
-# 懒加载读取 (适合大文件)
+# Lazy loading (efficient for large files)
 cap = pyshark.FileCapture('input.pcap', display_filter='http')
 for pkt in cap:
-print(pkt.http.host)
+    print(pkt.http.host)
 
-#### 3. Pandas (数据统计)
+```
 
-通常结合 CSV 使用。先用 Tshark 导出为 CSV，再用 Pandas 分析。
+**Snippet: Pandas (Statistical Analysis)**
+*Best used with CSVs exported from Tshark.*
+
+```python
+import pandas as pd
+df = pd.read_csv('tshark_export.csv')
+print(df['ip.src'].value_counts().head())
+
+```
+
+## 4. Operational Constraints
+
+* **Paths**: Always use absolute paths (e.g., `/data/capture.pcap`).
+* **Quoting**: In DuckDB SQL, wrap dotted fields in double quotes: `"id.orig_h"`.
+* **Timestamps**: Zeek `ts` is Unix epoch. Use `to_timestamp(ts)` in SQL.
+* **Flows**: The `flow_index` table links Zeek metadata to raw PCAP files. Join on IPs/Ports if needed.

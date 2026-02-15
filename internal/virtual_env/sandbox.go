@@ -8,7 +8,7 @@ import (
 )
 
 func GetOperator(ctx context.Context) (commandline.Operator, error) {
-	op, err := sandbox.NewDockerSandbox(ctx, &sandbox.Config{Image: "net-analyzer:latest", VolumeBindings: map[string]string{
+	op, err := sandbox.NewDockerSandbox(ctx, &sandbox.Config{Image: "net-analyzer-v3:latest", VolumeBindings: map[string]string{
 		"/home/hugo/ubuntu-mount": "/home/linuxbrew/pcaps",
 	}})
 	if err != nil {

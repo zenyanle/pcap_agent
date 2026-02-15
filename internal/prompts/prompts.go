@@ -2,6 +2,7 @@ package prompts
 
 import (
 	"embed"
+	"errors"
 	"io/fs"
 	"path/filepath"
 )
@@ -42,4 +43,16 @@ func GetPrompts() (map[string]string, error) {
 	}
 
 	return prompts, nil
+}
+
+func GetSinglePrompt(name string) (val string, err error) {
+	prompts, err := GetPrompts()
+	if err != nil {
+		return "", err
+	}
+	val, ok := prompts[name]
+	if !ok {
+		return "", errors.New("the prompt is not exist")
+	}
+	return val, nil
 }

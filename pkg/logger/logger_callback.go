@@ -5,17 +5,24 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+
 	"github.com/cloudwego/eino/callbacks"
 	"github.com/cloudwego/eino/flow/agent/react"
 	"github.com/cloudwego/eino/schema"
-	"io"
+	"github.com/elastic/go-elasticsearch/v7"
 )
 
 type LoggerCallback struct {
-	callbacks.HandlerBuilder // 可以用 callbacks.HandlerBuilder 来辅助实现 callback
+	Es *elasticsearch.Client
+	//callbacks.HandlerBuilder // 可以用 callbacks.HandlerBuilder 来辅助实现 callback
 }
 
 func (cb *LoggerCallback) OnStart(ctx context.Context, info *callbacks.RunInfo, input callbacks.CallbackInput) context.Context {
+	err := SendWrappedLog(cb.Es, "test_logs", "callback", input)
+	if err != nil {
+		Warnf("[OnStart] ES 日志写入失败: %v", err)
+	}
 	fmt.Println("==================")
 	inputStr, _ := json.MarshalIndent(input, "", "  ")
 	fmt.Printf("[OnStart] %s\n", string(inputStr))
@@ -23,6 +30,10 @@ func (cb *LoggerCallback) OnStart(ctx context.Context, info *callbacks.RunInfo, 
 }
 
 func (cb *LoggerCallback) OnEnd(ctx context.Context, info *callbacks.RunInfo, output callbacks.CallbackOutput) context.Context {
+	err := SendWrappedLog(cb.Es, "test_logs", "callback", output)
+	if err != nil {
+		Warnf("[OnEnd] ES 日志写入失败: %v", err)
+	}
 	fmt.Println("=========[OnEnd]=========")
 	outputStr, _ := json.MarshalIndent(output, "", "  ")
 	fmt.Println(string(outputStr))
@@ -37,11 +48,15 @@ func (cb *LoggerCallback) OnError(ctx context.Context, info *callbacks.RunInfo, 
 
 // PrettyLoggerCallback 提供美观易读的日志输出
 type PrettyLoggerCallback struct {
-	callbacks.HandlerBuilder
+	Es   *elasticsearch.Client
 	step int
 }
 
 func (cb *PrettyLoggerCallback) OnStart(ctx context.Context, info *callbacks.RunInfo, input callbacks.CallbackInput) context.Context {
+	err := SendWrappedLog(cb.Es, "test_logs", "callback", input)
+	if err != nil {
+		Warnf("[OnStart] ES 日志写入失败: %v", err)
+	}
 	cb.step++
 	fmt.Printf("\n╔════════════════════════════════════════════════════════════╗\n")
 	fmt.Printf("║ 步骤 #%d - %s 开始\n", cb.step, info.Name)
@@ -80,6 +95,10 @@ func (cb *PrettyLoggerCallback) OnStart(ctx context.Context, info *callbacks.Run
 }
 
 func (cb *PrettyLoggerCallback) OnEnd(ctx context.Context, info *callbacks.RunInfo, output callbacks.CallbackOutput) context.Context {
+	err := SendWrappedLog(cb.Es, "test_logs", "callback", output)
+	if err != nil {
+		Warnf("[OnEnd] ES 日志写入失败: %v", err)
+	}
 	fmt.Printf("\n┌────────────────────────────────────────────────────────────┐\n")
 	fmt.Printf("│ %s 完成\n", info.Name)
 	fmt.Printf("├────────────────────────────────────────────────────────────┤\n")

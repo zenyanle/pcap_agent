@@ -35,7 +35,7 @@ import (
 //   - Main content
 //   - Multi-modal text parts (user input and assistant output)
 //   - Tool call function names and arguments
-func defaultCounterToken(ctx context.Context, msgs []adk.Message) (tokenNum []int64, err error) {
+func defaultCounterToken(_ context.Context, msgs []adk.Message) (tokenNum []int64, err error) {
 	const encoding = "cl100k_base"
 	tkt, err := tiktoken.GetEncoding(encoding)
 	if err != nil {

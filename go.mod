@@ -8,6 +8,7 @@ require (
 	github.com/cloudwego/eino-examples v0.0.0-20260203133155-1f40592b7e48
 	github.com/cloudwego/eino-ext/components/model/openai v0.1.8
 	github.com/cloudwego/eino-ext/components/tool/commandline v0.0.0-20260204064123-1f91f547c77e
+	github.com/elastic/go-elasticsearch/v7 v7.17.10
 	github.com/pkoukk/tiktoken-go v0.1.8
 )
 
