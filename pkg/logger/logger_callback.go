@@ -49,7 +49,7 @@ func (cb *LoggerCallback) OnError(ctx context.Context, info *callbacks.RunInfo, 
 // PrettyLoggerCallback 提供美观易读的日志输出
 type PrettyLoggerCallback struct {
 	Es   *elasticsearch.Client
-	step int
+	Step int // 内部回调事件计数，每次 OnStart +1；可用于估算 ReAct 轮数
 }
 
 func (cb *PrettyLoggerCallback) OnStart(ctx context.Context, info *callbacks.RunInfo, input callbacks.CallbackInput) context.Context {
@@ -57,9 +57,9 @@ func (cb *PrettyLoggerCallback) OnStart(ctx context.Context, info *callbacks.Run
 	if err != nil {
 		Warnf("[OnStart] ES 日志写入失败: %v", err)
 	}
-	cb.step++
+	cb.Step++
 	fmt.Printf("\n╔════════════════════════════════════════════════════════════╗\n")
-	fmt.Printf("║ 步骤 #%d - %s 开始\n", cb.step, info.Name)
+	fmt.Printf("║ 步骤 #%d - %s 开始\n", cb.Step, info.Name)
 	fmt.Printf("╠════════════════════════════════════════════════════════════╣\n")
 
 	// 美化输入展示

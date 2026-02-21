@@ -7,9 +7,11 @@ import (
 	"pcap_agent/internal/prompts"
 	"pcap_agent/pkg/logger"
 	"strings"
+	"sync"
 
 	"github.com/cloudwego/eino/components/prompt"
 	"github.com/cloudwego/eino/compose"
+	"github.com/cloudwego/eino/flow/agent"
 	"github.com/cloudwego/eino/flow/agent/react"
 	"github.com/cloudwego/eino/schema"
 
@@ -18,10 +20,8 @@ import (
 
 // Step 代表单个执行步骤
 type Step struct {
-	StepID         int    `json:"step_id"`
-	Intent         string `json:"intent"`          // 这一步的意图（给人类看的解释）
-	ExpectedInput  string `json:"expected_input"`  // executor在完成上一步之后应该给这一步传递什么信息，自然语言描述
-	ExpectedOutput string `json:"expected_output"` // executor在完成这一步之后应该给下一步传递什么信息，自然语言描述
+	StepID int    `json:"step_id"`
+	Intent string `json:"intent"` // 这一步的意图，executor 按此开展工作
 }
 
 // Plan 是 LLM 返回的顶层结构
@@ -94,13 +94,23 @@ func MakePlanner(rAgent *react.Agent, es *elasticsearch.Client) (compose.Runnabl
 	_ = g.AddChatTemplateNode(nodeOfPrompt, tpl)
 	_ = g.AddLambdaNode(nodeOfReAct, agentLambda)
 	_ = g.AddLambdaNode(nodeOfParse, compose.InvokableLambda(func(ctx context.Context, input *schema.Message) (Plan, error) {
+		// 上报 ReAct 原始输出
+		metrics.Emit(logger.MetricsEvent{
+			LogType: logger.LTPlannerRawOutput,
+			Phase:   logger.PhasePlanner,
+			Event:   "react_output",
+			Output:  map[string]string{"role": string(input.Role), "content": truncateStr(input.Content, 2000)},
+		})
+
 		var plan Plan
 		str, err := ExtractJSON(input.Content)
 		if err != nil {
 			metrics.Emit(logger.MetricsEvent{
-				Phase: logger.PhasePlanner,
-				Event: logger.EventPhaseError,
-				Error: fmt.Sprintf("extract json failed: %v", err),
+				LogType: logger.LTPlannerError,
+				Phase:   logger.PhasePlanner,
+				Event:   logger.EventPhaseError,
+				Error:   fmt.Sprintf("extract json failed: %v", err),
+				Input:   map[string]string{"raw_content": truncateStr(input.Content, 1000)},
 			})
 			return Plan{}, err
 		}
@@ -108,17 +118,20 @@ func MakePlanner(rAgent *react.Agent, es *elasticsearch.Client) (compose.Runnabl
 		err = json.Unmarshal([]byte(str), &plan)
 		if err != nil {
 			metrics.Emit(logger.MetricsEvent{
-				Phase: logger.PhasePlanner,
-				Event: logger.EventPhaseError,
-				Error: fmt.Sprintf("unmarshal plan failed: %v", err),
+				LogType: logger.LTPlannerError,
+				Phase:   logger.PhasePlanner,
+				Event:   logger.EventPhaseError,
+				Error:   fmt.Sprintf("unmarshal plan failed: %v", err),
+				Input:   map[string]string{"extracted_json": truncateStr(str, 1000)},
 			})
 			return Plan{}, fmt.Errorf("failed to unmarshal plan: %w | content: %s", err, input.Content)
 		}
 		metrics.Emit(logger.MetricsEvent{
+			LogType:    logger.LTPlannerParsed,
 			Phase:      logger.PhasePlanner,
 			Event:      logger.EventPlanParsed,
 			TotalSteps: len(plan.Steps),
-			Detail:     plan,
+			Output:     plan,
 		})
 		logger.Infof("[Planner] plan parsed: %d steps", len(plan.Steps))
 		return plan, nil
@@ -224,21 +237,26 @@ type RichBundle[I any, O any, S any] struct {
 
 type PlanState struct {
 	Plan             Plan
-	ExecutorContexts []ExecutorContext
+	CurrentStepIndex int      // 当前执行到第几步 (0-based)
+	ResearchFindings string   // 累积的研究发现报告，各 agent 主动贡献
+	OperationLog     []string // 追加式操作日志，每个 executor 只记录自己的动作
 	EndOutput        string
 }
 
-type ExecutorContext struct {
-	Input            string
-	MainIdea         string
-	OperationHistory string
-	Step
+type normalOutput struct {
+	Findings  flexString `json:"findings"`   // 本步骤的研究发现
+	MyActions flexString `json:"my_actions"` // 本步骤执行的具体操作日志
 }
 
-type normalOutput struct {
-	MainIdeaToNext         flexString `json:"main_idea_to_next"`
-	OperationHistoryToNext flexString `json:"operation_history_to_next"`
-	InputToNext            flexString `json:"input_to_next"`
+// formatPlanOverview 将 Plan 格式化为可读的文本摘要
+func formatPlanOverview(p Plan) string {
+	var sb strings.Builder
+	sb.WriteString("## Investigation Plan\n\n")
+	sb.WriteString("**Planner Thought**: " + p.Thought + "\n\n")
+	for _, s := range p.Steps {
+		sb.WriteString(fmt.Sprintf("- **Step %d**: %s\n", s.StepID, s.Intent))
+	}
+	return sb.String()
 }
 
 // flexString 兼容 LLM 返回 string 或 array 的情况，统一转成 string
@@ -275,34 +293,58 @@ func (n *NormalExecutor) MakePrepareTmplMapBundle() RichBundle[any, map[string]a
 		return nil, nil
 	})
 	PrepareTmplMapPostHook := func(ctx context.Context, out map[string]any, state *PlanState) (map[string]any, error) {
-		if len(state.ExecutorContexts) == 0 {
+		idx := state.CurrentStepIndex
+		if idx >= len(state.Plan.Steps) {
 			n.metrics.Emit(logger.MetricsEvent{
-				Phase: logger.PhaseExecutor,
-				Event: logger.EventStepError,
-				Error: "ExecutorContexts is empty in NormalExecutor",
+				LogType: logger.LTNormalPrepare,
+				Phase:   logger.PhaseExecutor,
+				Event:   logger.EventStepError,
+				Error:   fmt.Sprintf("step index %d out of range (total %d)", idx, len(state.Plan.Steps)),
 			})
-			return nil, fmt.Errorf("ExecutorContexts is empty")
+			return nil, fmt.Errorf("step index %d out of range", idx)
 		}
-		getOne := state.ExecutorContexts[0]
-		state.ExecutorContexts = state.ExecutorContexts[1:]
+		step := state.Plan.Steps[idx]
 
-		n.metrics.Emit(logger.MetricsEvent{
-			Phase:      logger.PhaseExecutor,
-			Event:      logger.EventStepStart,
-			StepID:     getOne.StepID,
-			StepIntent: getOne.Intent,
-			TotalSteps: len(state.Plan.Steps),
-		})
-		logger.Infof("[Executor] step %d start: %s", getOne.StepID, getOne.Intent)
+		logger.Infof("[Executor] step %d start: %s", step.StepID, step.Intent)
+
+		// 格式化全局计划概览
+		planOverview := formatPlanOverview(state.Plan)
+
+		// 格式化操作日志
+		opLog := strings.Join(state.OperationLog, "\n---\n")
+		if opLog == "" {
+			opLog = "(No operations performed yet — you are the first executor)"
+		}
+
+		// 研究发现
+		findings := state.ResearchFindings
+		if findings == "" {
+			findings = "(No research findings yet — you are the first executor)"
+		}
 
 		ret := map[string]any{
-			"main_idea":         getOne.MainIdea,
-			"operation_history": getOne.OperationHistory,
-			"input":             getOne.Input,
-			"expected_output":   getOne.ExpectedOutput,
+			"plan_overview":     planOverview,
+			"research_findings": findings,
+			"operation_log":     opLog,
+			"current_step":      fmt.Sprintf("Step %d: %s", step.StepID, step.Intent),
 		}
-		logger.Infof("[NormalExecutor] input to step %d:\n  main_idea: %s\n  input: %s\n  expected_output: %s",
-			getOne.StepID, truncateStr(getOne.MainIdea, 200), truncateStr(getOne.Input, 200), truncateStr(getOne.ExpectedOutput, 200))
+
+		// 上报 step 开始 + 模板注入数据
+		n.metrics.Emit(logger.MetricsEvent{
+			LogType:    logger.LTNormalPrepare,
+			Phase:      logger.PhaseExecutor,
+			Event:      logger.EventStepStart,
+			StepID:     step.StepID,
+			StepIntent: step.Intent,
+			TotalSteps: len(state.Plan.Steps),
+			Input: map[string]string{
+				"current_step":      ret["current_step"].(string),
+				"research_findings": truncateStr(findings, 500),
+				"operation_log":     truncateStr(opLog, 500),
+			},
+		})
+		logger.Infof("[NormalExecutor] input to step %d:\n  current_step: %s",
+			step.StepID, step.Intent)
 		return ret, nil
 	}
 	return RichBundle[any, map[string]any, PlanState]{
@@ -328,23 +370,66 @@ func (n *NormalExecutor) ParseToExecutorContextBundle() RichBundle[*schema.Messa
 	})
 
 	ParseToExecutorContextPreHook := func(ctx context.Context, in *schema.Message, state *PlanState) (*schema.Message, error) {
+		idx := state.CurrentStepIndex
+		step := state.Plan.Steps[idx]
+
 		str, err := ExtractJSON(in.Content)
 		if err != nil {
-			return nil, err
+			n.metrics.Emit(logger.MetricsEvent{
+				LogType:    logger.LTNormalParseError,
+				Phase:      logger.PhaseExecutor,
+				Event:      "extract_json_failed",
+				StepID:     step.StepID,
+				StepIntent: step.Intent,
+				Error:      err.Error(),
+				Input:      map[string]string{"raw_content": truncateStr(in.Content, 1000)},
+			})
+			return nil, fmt.Errorf("extract JSON from executor output failed: %w", err)
 		}
-		var n normalOutput
-		err = json.Unmarshal([]byte(str), &n)
+		var parsed normalOutput
+		err = json.Unmarshal([]byte(str), &parsed)
 		if err != nil {
-			return nil, err
+			n.metrics.Emit(logger.MetricsEvent{
+				LogType:    logger.LTNormalParseError,
+				Phase:      logger.PhaseExecutor,
+				Event:      "unmarshal_failed",
+				StepID:     step.StepID,
+				StepIntent: step.Intent,
+				Error:      err.Error(),
+				Input:      map[string]string{"extracted_json": truncateStr(str, 1000)},
+			})
+			return nil, fmt.Errorf("unmarshal executor output failed: %w", err)
 		}
-		// 直接通过索引修改 slice 元素，避免值拷贝导致写入无效
-		state.ExecutorContexts[0].MainIdea = string(n.MainIdeaToNext)
-		state.ExecutorContexts[0].Input = string(n.InputToNext)
-		state.ExecutorContexts[0].OperationHistory = string(n.OperationHistoryToNext)
 
-		logger.Infof("[NormalExecutor] output parsed:\n  main_idea_to_next: %s\n  input_to_next: %s\n  operation_history_to_next: %s",
-			truncateStr(string(n.MainIdeaToNext), 300), truncateStr(string(n.InputToNext), 300), truncateStr(string(n.OperationHistoryToNext), 300))
-		logger.Infof("[Executor] normal step done, handing off to next")
+		// 追加研究发现到累积报告
+		if string(parsed.Findings) != "" {
+			state.ResearchFindings += fmt.Sprintf("\n\n### Step %d: %s\n%s", step.StepID, step.Intent, string(parsed.Findings))
+		}
+
+		// 追加本步骤的操作日志
+		if string(parsed.MyActions) != "" {
+			state.OperationLog = append(state.OperationLog, fmt.Sprintf("[Step %d - %s]\n%s", step.StepID, step.Intent, string(parsed.MyActions)))
+		}
+
+		// 上报解析后的输出数据
+		n.metrics.Emit(logger.MetricsEvent{
+			LogType:    logger.LTNormalParsed,
+			Phase:      logger.PhaseExecutor,
+			Event:      "step_parsed",
+			StepID:     step.StepID,
+			StepIntent: step.Intent,
+			Output: map[string]string{
+				"findings":   truncateStr(string(parsed.Findings), 1000),
+				"my_actions": truncateStr(string(parsed.MyActions), 1000),
+			},
+		})
+
+		// 推进步骤索引
+		state.CurrentStepIndex++
+
+		logger.Infof("[NormalExecutor] step %d done, parsed output:\n  findings: %s\n  my_actions: %s",
+			step.StepID, truncateStr(string(parsed.Findings), 300), truncateStr(string(parsed.MyActions), 300))
+		logger.Infof("[Executor] step %d completed, advancing to step index %d", step.StepID, state.CurrentStepIndex)
 		return nil, nil
 	}
 
@@ -368,35 +453,56 @@ func (f *FinalExecutor) MakePrepareTmplMapBundle() RichBundle[any, map[string]an
 		return nil, nil
 	})
 	PrepareTmplMapPostHook := func(ctx context.Context, out map[string]any, state *PlanState) (map[string]any, error) {
-		if len(state.ExecutorContexts) == 0 {
+		idx := state.CurrentStepIndex
+		if idx >= len(state.Plan.Steps) {
 			f.metrics.Emit(logger.MetricsEvent{
-				Phase: logger.PhaseExecutor,
-				Event: logger.EventStepError,
-				Error: "ExecutorContexts is empty in FinalExecutor",
+				LogType: logger.LTFinalPrepare,
+				Phase:   logger.PhaseExecutor,
+				Event:   logger.EventStepError,
+				Error:   fmt.Sprintf("step index %d out of range in FinalExecutor (total %d)", idx, len(state.Plan.Steps)),
 			})
-			return nil, fmt.Errorf("ExecutorContexts is empty")
+			return nil, fmt.Errorf("step index %d out of range in FinalExecutor", idx)
 		}
-		getOne := state.ExecutorContexts[0]
-		state.ExecutorContexts = state.ExecutorContexts[1:]
+		step := state.Plan.Steps[idx]
 
-		f.metrics.Emit(logger.MetricsEvent{
-			Phase:      logger.PhaseExecutor,
-			Event:      logger.EventStepStart,
-			StepID:     getOne.StepID,
-			StepIntent: getOne.Intent,
-			TotalSteps: len(state.Plan.Steps),
-			Detail:     map[string]string{"type": "final"},
-		})
-		logger.Infof("[Executor] final step %d start: %s", getOne.StepID, getOne.Intent)
+		logger.Infof("[Executor] final step %d start: %s", step.StepID, step.Intent)
+
+		// 格式化全局计划概览
+		planOverview := formatPlanOverview(state.Plan)
+
+		// 格式化操作日志
+		opLog := strings.Join(state.OperationLog, "\n---\n")
+		if opLog == "" {
+			opLog = "(No operations recorded)"
+		}
+
+		// 研究发现
+		findings := state.ResearchFindings
+		if findings == "" {
+			findings = "(No research findings accumulated)"
+		}
 
 		ret := map[string]any{
-			"main_idea":         getOne.MainIdea,
-			"operation_history": getOne.OperationHistory,
-			"input":             getOne.Input,
-			//"expected_output":   getOne.ExpectedOutput,
+			"plan_overview":     planOverview,
+			"research_findings": findings,
+			"operation_log":     opLog,
 		}
-		logger.Infof("[FinalExecutor] input to final step %d:\n  main_idea: %s\n  input: %s",
-			getOne.StepID, truncateStr(getOne.MainIdea, 300), truncateStr(getOne.Input, 300))
+
+		// 上报 final step 开始 + 输入数据
+		f.metrics.Emit(logger.MetricsEvent{
+			LogType:    logger.LTFinalPrepare,
+			Phase:      logger.PhaseExecutor,
+			Event:      logger.EventStepStart,
+			StepID:     step.StepID,
+			StepIntent: step.Intent,
+			TotalSteps: len(state.Plan.Steps),
+			Input: map[string]string{
+				"research_findings": truncateStr(findings, 500),
+				"operation_log":     truncateStr(opLog, 500),
+			},
+		})
+		logger.Infof("[FinalExecutor] input to final step %d:\n  findings: %s",
+			step.StepID, truncateStr(findings, 300))
 		return ret, nil
 	}
 	return RichBundle[any, map[string]any, PlanState]{
@@ -420,9 +526,13 @@ func (f *FinalExecutor) IntroduceTmplBundle() BaseTplBundle {
 func (f *FinalExecutor) ParseToFinalBundle() BaseBundle {
 	ParseToFinal := compose.InvokableLambda(func(ctx context.Context, in *schema.Message) (out string, err error) {
 		f.metrics.Emit(logger.MetricsEvent{
-			Phase:  logger.PhaseExecutor,
-			Event:  logger.EventFinalOutput,
-			Detail: map[string]int{"content_length": len(in.Content)},
+			LogType: logger.LTFinalOutput,
+			Phase:   logger.PhaseExecutor,
+			Event:   logger.EventFinalOutput,
+			Output: map[string]any{
+				"content_length": len(in.Content),
+				"content":        truncateStr(in.Content, 2000),
+			},
 		})
 		logger.Infof("[FinalExecutor] output (length=%d):\n%s", len(in.Content), truncateStr(in.Content, 1000))
 		return in.Content, nil
@@ -449,21 +559,20 @@ func MakeIsLast(metrics *logger.Metrics) RichBundle[any, bool, PlanState] {
 		return false, nil
 	})
 	IsLastPostHook := func(ctx context.Context, out bool, state *PlanState) (bool, error) {
-		remaining := len(state.ExecutorContexts)
+		remaining := len(state.Plan.Steps) - state.CurrentStepIndex
 		isLast := remaining == 1
 		metrics.Emit(logger.MetricsEvent{
-			Phase: logger.PhaseExecutor,
-			Event: logger.EventLoopEnter,
+			LogType: logger.LTExecutorLoopCheck,
+			Phase:   logger.PhaseExecutor,
+			Event:   logger.EventLoopEnter,
 			Detail: map[string]any{
-				"remaining_steps": remaining,
-				"is_last":         isLast,
+				"current_step_index": state.CurrentStepIndex,
+				"remaining_steps":    remaining,
+				"is_last":            isLast,
 			},
 		})
-		logger.Infof("[Executor] loop check: remaining=%d, isLast=%v", remaining, isLast)
-		if isLast {
-			return true, nil
-		}
-		return false, nil
+		logger.Infof("[Executor] loop check: currentIndex=%d, remaining=%d, isLast=%v", state.CurrentStepIndex, remaining, isLast)
+		return isLast, nil
 	}
 	return RichBundle[any, bool, PlanState]{
 		Runner:   IsLast,
@@ -477,34 +586,29 @@ func MakeExecutor(rAgent *react.Agent, plan Plan, es *elasticsearch.Client) (str
 	metrics := logger.NewMetrics(es)
 
 	metrics.Emit(logger.MetricsEvent{
+		LogType:    logger.LTExecutorStart,
 		Phase:      logger.PhaseExecutor,
 		Event:      logger.EventPhaseStart,
 		TotalSteps: len(plan.Steps),
-		Detail:     plan,
+		Input:      plan,
 	})
 	executorTimer := logger.NewTimer()
 
 	if len(plan.Steps) == 0 {
 		metrics.Emit(logger.MetricsEvent{
-			Phase: logger.PhaseExecutor,
-			Event: logger.EventPhaseError,
-			Error: "plan steps is empty",
+			LogType: logger.LTExecutorError,
+			Phase:   logger.PhaseExecutor,
+			Event:   logger.EventPhaseError,
+			Error:   "plan steps is empty",
 		})
 		return "", fmt.Errorf("plan steps is empty")
 	}
 	prepareStateFunc := func(ctx context.Context) *PlanState {
-		ec := make([]ExecutorContext, len(plan.Steps))
-		for i := range ec {
-			ec[i].Step = plan.Steps[i]
-		}
-
-		ec[0].Input = "you are first executor agent, Here`s the thought of planner" + plan.Thought
-		ec[0].MainIdea = "you are first executor agent, no last main idea"
-		ec[0].OperationHistory = "you are first executor agent, no operation history"
-
 		return &PlanState{
 			Plan:             plan,
-			ExecutorContexts: ec,
+			CurrentStepIndex: 0,
+			ResearchFindings: "",
+			OperationLog:     []string{},
 			EndOutput:        "",
 		}
 	}
@@ -517,19 +621,45 @@ func MakeExecutor(rAgent *react.Agent, plan Plan, es *elasticsearch.Client) (str
 	agentLambda, _ := compose.AnyLambda(rAgent.Generate, nil, nil, nil)
 	_ = agentLambda
 
-	// 包装 ReAct agent，添加输入/输出日志
-	reactWithLog := func(label string) *compose.Lambda {
+	// 每个 step 的 ReAct 回调事件计数（用于估算轮数）
+	type stepRoundInfo struct {
+		Label        string `json:"label"`
+		CallbackStep int    `json:"callback_steps"` // OnStart 回调次数
+		DurationMs   int64  `json:"duration_ms"`
+	}
+	var (
+		roundRecords []stepRoundInfo
+		roundMu      sync.Mutex
+	)
+
+	// 包装 ReAct agent，添加输入/输出日志 + WithCallbacks（模仿 main.go 的上报模式）
+	reactWithLog := func(label string, logTypeOutput string, logTypeError string) *compose.Lambda {
 		wrapped := compose.InvokableLambda(func(ctx context.Context, in []*schema.Message) (*schema.Message, error) {
 			logger.Infof("[%s] input messages count: %d", label, len(in))
 			for i, msg := range in {
 				logger.Infof("[%s]   msg[%d] role=%s content=%s", label, i, msg.Role, truncateStr(msg.Content, 300))
 			}
+			cb := &logger.PrettyLoggerCallback{Es: es}
 			timer := logger.NewTimer()
-			out, err := rAgent.Generate(ctx, in)
+			out, err := rAgent.Generate(ctx, in,
+				agent.WithComposeOptions(compose.WithCallbacks(cb)),
+			)
 			elapsed := timer.ElapsedMs()
+
+			// 记录本次 ReAct 调用的回调事件数
+			roundMu.Lock()
+			roundRecords = append(roundRecords, stepRoundInfo{
+				Label:        label,
+				CallbackStep: cb.Step,
+				DurationMs:   elapsed,
+			})
+			roundMu.Unlock()
+			logger.Infof("[%s] callback events: %d (duration %dms)", label, cb.Step, elapsed)
+
 			if err != nil {
 				logger.Errorf("[%s] error after %dms: %v", label, elapsed, err)
 				metrics.Emit(logger.MetricsEvent{
+					LogType:    logTypeError,
 					Phase:      logger.PhaseExecutor,
 					Event:      logger.EventStepError,
 					DurationMs: elapsed,
@@ -540,10 +670,16 @@ func MakeExecutor(rAgent *react.Agent, plan Plan, es *elasticsearch.Client) (str
 			}
 			logger.Infof("[%s] output (%dms) role=%s content=%s", label, elapsed, out.Role, truncateStr(out.Content, 500))
 			metrics.Emit(logger.MetricsEvent{
+				LogType:    logTypeOutput,
 				Phase:      logger.PhaseExecutor,
 				Event:      logger.EventStepEnd,
 				DurationMs: elapsed,
-				Detail:     map[string]string{"node": label, "content_length": fmt.Sprintf("%d", len(out.Content))},
+				Output: map[string]any{
+					"node":           label,
+					"content_length": len(out.Content),
+					"content":        truncateStr(out.Content, 2000),
+					"callback_steps": cb.Step,
+				},
 			})
 			return out, nil
 		})
@@ -552,8 +688,8 @@ func MakeExecutor(rAgent *react.Agent, plan Plan, es *elasticsearch.Client) (str
 
 	ReAct1 := "ReAct1"
 	ReAct2 := "ReAct2"
-	react1Lambda := reactWithLog("ReAct-NormalExecutor")
-	react2Lambda := reactWithLog("ReAct-FinalExecutor")
+	react1Lambda := reactWithLog("ReAct-NormalExecutor", logger.LTNormalReactOutput, logger.LTNormalReactError)
+	react2Lambda := reactWithLog("ReAct-FinalExecutor", logger.LTFinalReactOutput, logger.LTFinalReactError)
 
 	g := compose.NewGraph[any, string](compose.WithGenLocalState(prepareStateFunc))
 
@@ -610,6 +746,7 @@ func MakeExecutor(rAgent *react.Agent, plan Plan, es *elasticsearch.Client) (str
 	res, err := r.Invoke(ctx, struct{}{})
 	if err != nil {
 		metrics.Emit(logger.MetricsEvent{
+			LogType:    logger.LTExecutorError,
 			Phase:      logger.PhaseExecutor,
 			Event:      logger.EventPhaseError,
 			DurationMs: executorTimer.ElapsedMs(),
@@ -618,13 +755,26 @@ func MakeExecutor(rAgent *react.Agent, plan Plan, es *elasticsearch.Client) (str
 		return "", err
 	}
 
+	// 上报每个 step 的 ReAct 轮数统计
+	roundMu.Lock()
+	roundSummary := make([]stepRoundInfo, len(roundRecords))
+	copy(roundSummary, roundRecords)
+	roundMu.Unlock()
+
 	metrics.Emit(logger.MetricsEvent{
+		LogType:    logger.LTExecutorEnd,
 		Phase:      logger.PhaseExecutor,
 		Event:      logger.EventPhaseEnd,
 		DurationMs: executorTimer.ElapsedMs(),
 		TotalSteps: len(plan.Steps),
+		Output: map[string]any{
+			"step_react_rounds": roundSummary,
+		},
 	})
-	logger.Infof("[Executor] completed in %dms", executorTimer.ElapsedMs())
+	logger.Infof("[Executor] completed in %dms, react round summary:", executorTimer.ElapsedMs())
+	for i, r := range roundSummary {
+		logger.Infof("  [%d] %s: %d callback events, %dms", i, r.Label, r.CallbackStep, r.DurationMs)
+	}
 
 	return res, nil
 

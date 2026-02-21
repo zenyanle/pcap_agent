@@ -50,5 +50,28 @@ func SendWrappedLog(client *elasticsearch.Client, streamName string, logType str
 		return fmt.Errorf("写入失败: %s", res.String())
 	}
 
+	// 检查 Bulk 响应中的 item 级错误
+	var bulkResp struct {
+		Errors bool `json:"errors"`
+		Items  []struct {
+			Index struct {
+				Error  json.RawMessage `json:"error,omitempty"`
+				Status int             `json:"status"`
+			} `json:"index"`
+		} `json:"items"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&bulkResp); err != nil {
+		// 解码失败不阻断，只记录
+		Warnf("[SendWrappedLog] 解析 bulk 响应失败: %v", err)
+		return nil
+	}
+	if bulkResp.Errors {
+		for _, item := range bulkResp.Items {
+			if item.Index.Error != nil {
+				return fmt.Errorf("bulk item 写入失败 (status=%d): %s", item.Index.Status, string(item.Index.Error))
+			}
+		}
+	}
+
 	return nil
 }
