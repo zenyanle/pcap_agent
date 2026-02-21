@@ -1,0 +1,730 @@
+package orche
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"pcap_agent/internal/prompts"
+	"pcap_agent/pkg/logger"
+	"strings"
+
+	"github.com/cloudwego/eino/components/prompt"
+	"github.com/cloudwego/eino/compose"
+	"github.com/cloudwego/eino/flow/agent/react"
+	"github.com/cloudwego/eino/schema"
+
+	"github.com/elastic/go-elasticsearch/v7"
+)
+
+// Step 代表单个执行步骤
+type Step struct {
+	StepID         int    `json:"step_id"`
+	Intent         string `json:"intent"`          // 这一步的意图（给人类看的解释）
+	ExpectedInput  string `json:"expected_input"`  // executor在完成上一步之后应该给这一步传递什么信息，自然语言描述
+	ExpectedOutput string `json:"expected_output"` // executor在完成这一步之后应该给下一步传递什么信息，自然语言描述
+}
+
+// Plan 是 LLM 返回的顶层结构
+type Plan struct {
+	Thought string `json:"thought"` // LLM 的推理过程（思维链）
+	Steps   []Step `json:"steps"`   // 执行步骤列表
+}
+
+func ExtractJSON(input string) (string, error) {
+	// 1. 处理 Markdown 代码块 (```json ... ```)
+	if strings.Contains(input, "```") {
+		start := strings.Index(input, "```")
+		// 寻找代码块结尾
+		end := strings.LastIndex(input, "```")
+		if end > start {
+			// 去掉 ```json 或者 ```xml 等标记
+			content := input[start+3 : end]
+			// 如果是以 json 开头（例如 ```json），去掉它
+			if idx := strings.Index(content, "\n"); idx != -1 {
+				// 简单的启发式：如果第一行包含 "json"，则跳过第一行
+				if strings.Contains(strings.ToLower(content[:idx]), "json") {
+					content = content[idx+1:]
+				}
+			}
+			input = content
+		}
+	}
+
+	// 2. 暴力定位：找到第一个 '{' 或 '[' 和最后一个 '}' 或 ']'
+	// 这里为了简化演示，假设是 Object 类型。如果是 Array 需要判断 '['
+	start := strings.Index(input, "{")
+	end := strings.LastIndex(input, "}")
+
+	if start == -1 || end == -1 || start > end {
+		return "", fmt.Errorf("no valid json object found")
+	}
+
+	// 截取纯净的 JSON 字符串
+	return input[start : end+1], nil
+}
+
+// truncateStr 截断字符串，超出 maxLen 时加省略号
+func truncateStr(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
+}
+
+func MakePlanner(rAgent *react.Agent, es *elasticsearch.Client) (compose.Runnable[map[string]any, Plan], error) {
+	ctx := context.Background()
+	metrics := logger.NewMetrics(es)
+
+	plannerPrompt, err := prompts.GetSinglePrompt("planner")
+	if err != nil {
+		logger.Fatalf("planner prompt not exsist", err)
+	}
+	tpl := prompt.FromMessages(schema.GoTemplate,
+		schema.SystemMessage(plannerPrompt),
+		schema.UserMessage("{{.user_input}}"))
+
+	agentLambda, _ := compose.AnyLambda(rAgent.Generate, nil, nil, nil)
+
+	nodeOfPrompt := "prompt"
+	nodeOfReAct := "ReAct"
+	nodeOfParse := "parse"
+
+	g := compose.NewGraph[map[string]any, Plan]()
+
+	_ = g.AddChatTemplateNode(nodeOfPrompt, tpl)
+	_ = g.AddLambdaNode(nodeOfReAct, agentLambda)
+	_ = g.AddLambdaNode(nodeOfParse, compose.InvokableLambda(func(ctx context.Context, input *schema.Message) (Plan, error) {
+		var plan Plan
+		str, err := ExtractJSON(input.Content)
+		if err != nil {
+			metrics.Emit(logger.MetricsEvent{
+				Phase: logger.PhasePlanner,
+				Event: logger.EventPhaseError,
+				Error: fmt.Sprintf("extract json failed: %v", err),
+			})
+			return Plan{}, err
+		}
+		logger.Infof("[Planner] extracted JSON: %s", str)
+		err = json.Unmarshal([]byte(str), &plan)
+		if err != nil {
+			metrics.Emit(logger.MetricsEvent{
+				Phase: logger.PhasePlanner,
+				Event: logger.EventPhaseError,
+				Error: fmt.Sprintf("unmarshal plan failed: %v", err),
+			})
+			return Plan{}, fmt.Errorf("failed to unmarshal plan: %w | content: %s", err, input.Content)
+		}
+		metrics.Emit(logger.MetricsEvent{
+			Phase:      logger.PhasePlanner,
+			Event:      logger.EventPlanParsed,
+			TotalSteps: len(plan.Steps),
+			Detail:     plan,
+		})
+		logger.Infof("[Planner] plan parsed: %d steps", len(plan.Steps))
+		return plan, nil
+	}))
+
+	_ = g.AddEdge(compose.START, nodeOfPrompt)
+	_ = g.AddEdge(nodeOfPrompt, nodeOfReAct)
+	_ = g.AddEdge(nodeOfReAct, nodeOfParse)
+	_ = g.AddEdge(nodeOfParse, compose.END)
+
+	r, err := g.Compile(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return r, nil
+}
+
+/*func MakeExecutor(rAgent *react.Agent, plan Plan) {
+	genStateFunc := func(ctx context.Context) *testState {
+		return &testState{
+			index:  0,
+			length: len(plan.Steps),
+		}
+	}
+
+	nodeOfL1 := "nodeOfL1"
+
+	g := compose.NewGraph[Plan, string](compose.WithGenLocalState(genStateFunc))
+
+	l1 := compose.InvokableLambda(func(ctx context.Context, in Plan) (out []Step, err error) {
+		return in.Steps, nil
+	})
+
+	toAnyMaps := compose.InvokableLambda(func(ctx context.Context, in any) (out map[string]any, err error) {
+		return map[string]any{
+			"plans": in,
+		}, nil
+	})
+	nodeOfAnymaps1 := "nodeOfAnymaps1"
+
+	l1StateToOutput := func(ctx context.Context, out []Plan, state *testState) ([]Plan, error) {
+		if state.index >= state.length {
+			return make([]Plan, 0), nil
+		}
+		newOut := out[state.index]
+		state.index++
+		return []Plan{newOut}, nil
+	}
+	nodeOfAnymaps1State := func(ctx context.Context, out map[string]any, state *testState) (map[string]any, error) {
+		out["passed_in"] = "you are first executor agent, no inputs"
+		return out, nil
+	}
+
+	tpl := prompt.FromMessages(schema.GoTemplate,
+		schema.SystemMessage(plannerPrompt),
+		schema.UserMessage("{{.user_input}}"))
+	tplBundle := struct {
+		Tpl  *prompt.DefaultChatTemplate
+		Name string
+	}{
+		Tpl:  tpl,
+		Name: "019c7415-f4c2-7607-b792-1d67cf8cc018",
+	}
+
+	agentLambda, _ := compose.AnyLambda(rAgent.Generate, nil, nil, nil)
+	agentLambdaBundle := struct {
+		Runner *compose.Lambda
+		Name   string
+	}{
+		Runner: agentLambda,
+		Name:   "019c7416-499d-7e28-9994-e27e8a61e497",
+	}
+
+	_ = g.AddLambdaNode(nodeOfL1, l1,
+		compose.WithStatePostHandler(l1StateToOutput))
+
+	_ = g.AddLambdaNode(nodeOfAnymaps1, toAnyMaps,
+		compose.WithStatePostHandler(nodeOfAnymaps1State))
+
+	_ = g.AddChatTemplateNode(tplBundle.Name, tplBundle.Tpl)
+	_ = g.AddLambdaNode(agentLambdaBundle.Name, agentLambdaBundle.Runner)
+	_ = g.AddLambdaNode()
+
+}*/
+
+type BaseBundle struct {
+	Runner *compose.Lambda
+	Name   string
+}
+
+type BaseTplBundle struct {
+	Name string
+	Tpl  *prompt.DefaultChatTemplate
+}
+
+type RichBundle[I any, O any, S any] struct {
+	Runner   *compose.Lambda
+	Name     string
+	PreHook  compose.StatePreHandler[I, *S]
+	PostHook compose.StatePostHandler[O, *S]
+}
+
+type PlanState struct {
+	Plan             Plan
+	ExecutorContexts []ExecutorContext
+	EndOutput        string
+}
+
+type ExecutorContext struct {
+	Input            string
+	MainIdea         string
+	OperationHistory string
+	Step
+}
+
+type normalOutput struct {
+	MainIdeaToNext         flexString `json:"main_idea_to_next"`
+	OperationHistoryToNext flexString `json:"operation_history_to_next"`
+	InputToNext            flexString `json:"input_to_next"`
+}
+
+// flexString 兼容 LLM 返回 string 或 array 的情况，统一转成 string
+type flexString string
+
+func (f *flexString) UnmarshalJSON(data []byte) error {
+	// 尝试作为 string 解析
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		*f = flexString(s)
+		return nil
+	}
+	// 尝试作为 []string 解析，拼接成单个字符串
+	var arr []string
+	if err := json.Unmarshal(data, &arr); err == nil {
+		*f = flexString(strings.Join(arr, "\n"))
+		return nil
+	}
+	// 兜底：直接用原始 JSON 文本
+	*f = flexString(string(data))
+	return nil
+}
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+type NormalExecutor struct {
+	tmplString string
+	metrics    *logger.Metrics
+}
+
+// any, map[string]any
+func (n *NormalExecutor) MakePrepareTmplMapBundle() RichBundle[any, map[string]any, PlanState] {
+	PrepareTmplMap := compose.InvokableLambda(func(ctx context.Context, in any) (out map[string]any, err error) {
+		return nil, nil
+	})
+	PrepareTmplMapPostHook := func(ctx context.Context, out map[string]any, state *PlanState) (map[string]any, error) {
+		if len(state.ExecutorContexts) == 0 {
+			n.metrics.Emit(logger.MetricsEvent{
+				Phase: logger.PhaseExecutor,
+				Event: logger.EventStepError,
+				Error: "ExecutorContexts is empty in NormalExecutor",
+			})
+			return nil, fmt.Errorf("ExecutorContexts is empty")
+		}
+		getOne := state.ExecutorContexts[0]
+		state.ExecutorContexts = state.ExecutorContexts[1:]
+
+		n.metrics.Emit(logger.MetricsEvent{
+			Phase:      logger.PhaseExecutor,
+			Event:      logger.EventStepStart,
+			StepID:     getOne.StepID,
+			StepIntent: getOne.Intent,
+			TotalSteps: len(state.Plan.Steps),
+		})
+		logger.Infof("[Executor] step %d start: %s", getOne.StepID, getOne.Intent)
+
+		ret := map[string]any{
+			"main_idea":         getOne.MainIdea,
+			"operation_history": getOne.OperationHistory,
+			"input":             getOne.Input,
+			"expected_output":   getOne.ExpectedOutput,
+		}
+		logger.Infof("[NormalExecutor] input to step %d:\n  main_idea: %s\n  input: %s\n  expected_output: %s",
+			getOne.StepID, truncateStr(getOne.MainIdea, 200), truncateStr(getOne.Input, 200), truncateStr(getOne.ExpectedOutput, 200))
+		return ret, nil
+	}
+	return RichBundle[any, map[string]any, PlanState]{
+		Runner:   PrepareTmplMap,
+		PostHook: PrepareTmplMapPostHook,
+		Name:     "PrepareTmplMap-019c746a-9645-73d5-879c-96dfb0ce881a",
+	}
+}
+
+func (n *NormalExecutor) IntroduceTmplBundle() BaseTplBundle {
+	tpl := prompt.FromMessages(schema.GoTemplate,
+		schema.SystemMessage(n.tmplString))
+
+	return BaseTplBundle{
+		Name: "IntroduceTmplBundle-019c79ca-9ebb-7864-8df5-2ff9f00de87b",
+		Tpl:  tpl,
+	}
+}
+
+func (n *NormalExecutor) ParseToExecutorContextBundle() RichBundle[*schema.Message, any, PlanState] {
+	ParseToExecutorContext := compose.InvokableLambda(func(ctx context.Context, in *schema.Message) (out any, err error) {
+		return nil, nil
+	})
+
+	ParseToExecutorContextPreHook := func(ctx context.Context, in *schema.Message, state *PlanState) (*schema.Message, error) {
+		str, err := ExtractJSON(in.Content)
+		if err != nil {
+			return nil, err
+		}
+		var n normalOutput
+		err = json.Unmarshal([]byte(str), &n)
+		if err != nil {
+			return nil, err
+		}
+		// 直接通过索引修改 slice 元素，避免值拷贝导致写入无效
+		state.ExecutorContexts[0].MainIdea = string(n.MainIdeaToNext)
+		state.ExecutorContexts[0].Input = string(n.InputToNext)
+		state.ExecutorContexts[0].OperationHistory = string(n.OperationHistoryToNext)
+
+		logger.Infof("[NormalExecutor] output parsed:\n  main_idea_to_next: %s\n  input_to_next: %s\n  operation_history_to_next: %s",
+			truncateStr(string(n.MainIdeaToNext), 300), truncateStr(string(n.InputToNext), 300), truncateStr(string(n.OperationHistoryToNext), 300))
+		logger.Infof("[Executor] normal step done, handing off to next")
+		return nil, nil
+	}
+
+	return RichBundle[*schema.Message, any, PlanState]{
+		PreHook: ParseToExecutorContextPreHook,
+		Runner:  ParseToExecutorContext,
+		Name:    "ParseToExecutorContext-019c7a0e-e202-7696-b79e-7fdf43c4e9ea",
+	}
+}
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+type FinalExecutor struct {
+	tmpString string
+	metrics   *logger.Metrics
+}
+
+// any, map[string]any
+func (f *FinalExecutor) MakePrepareTmplMapBundle() RichBundle[any, map[string]any, PlanState] {
+	PrepareTmplMap := compose.InvokableLambda(func(ctx context.Context, in any) (out map[string]any, err error) {
+		return nil, nil
+	})
+	PrepareTmplMapPostHook := func(ctx context.Context, out map[string]any, state *PlanState) (map[string]any, error) {
+		if len(state.ExecutorContexts) == 0 {
+			f.metrics.Emit(logger.MetricsEvent{
+				Phase: logger.PhaseExecutor,
+				Event: logger.EventStepError,
+				Error: "ExecutorContexts is empty in FinalExecutor",
+			})
+			return nil, fmt.Errorf("ExecutorContexts is empty")
+		}
+		getOne := state.ExecutorContexts[0]
+		state.ExecutorContexts = state.ExecutorContexts[1:]
+
+		f.metrics.Emit(logger.MetricsEvent{
+			Phase:      logger.PhaseExecutor,
+			Event:      logger.EventStepStart,
+			StepID:     getOne.StepID,
+			StepIntent: getOne.Intent,
+			TotalSteps: len(state.Plan.Steps),
+			Detail:     map[string]string{"type": "final"},
+		})
+		logger.Infof("[Executor] final step %d start: %s", getOne.StepID, getOne.Intent)
+
+		ret := map[string]any{
+			"main_idea":         getOne.MainIdea,
+			"operation_history": getOne.OperationHistory,
+			"input":             getOne.Input,
+			//"expected_output":   getOne.ExpectedOutput,
+		}
+		logger.Infof("[FinalExecutor] input to final step %d:\n  main_idea: %s\n  input: %s",
+			getOne.StepID, truncateStr(getOne.MainIdea, 300), truncateStr(getOne.Input, 300))
+		return ret, nil
+	}
+	return RichBundle[any, map[string]any, PlanState]{
+		Runner:   PrepareTmplMap,
+		PostHook: PrepareTmplMapPostHook,
+		Name:     "PrepareTmplMap-019c7ba4-846f-77fa-86b1-018f13a0fd30",
+	}
+}
+
+func (f *FinalExecutor) IntroduceTmplBundle() BaseTplBundle {
+	tpl := prompt.FromMessages(schema.GoTemplate,
+		schema.SystemMessage(f.tmpString))
+
+	return BaseTplBundle{
+		Name: "IntroduceTmplBundle-019c7ba5-a5bf-7030-bc82-8cd6cbbb472e",
+		Tpl:  tpl,
+	}
+}
+
+// 在这里解析出final output
+func (f *FinalExecutor) ParseToFinalBundle() BaseBundle {
+	ParseToFinal := compose.InvokableLambda(func(ctx context.Context, in *schema.Message) (out string, err error) {
+		f.metrics.Emit(logger.MetricsEvent{
+			Phase:  logger.PhaseExecutor,
+			Event:  logger.EventFinalOutput,
+			Detail: map[string]int{"content_length": len(in.Content)},
+		})
+		logger.Infof("[FinalExecutor] output (length=%d):\n%s", len(in.Content), truncateStr(in.Content, 1000))
+		return in.Content, nil
+	})
+
+	return BaseBundle{
+		Runner: ParseToFinal,
+		Name:   "ParseToFinal-019c7a13-2bb2-7051-a9a6-a1ee4bc44564",
+	}
+}
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/*func MakeExecutorReAct(rAgent *react.Agent) BaseBundle {
+	agentLambda, _ := compose.AnyLambda(rAgent.Generate, nil, nil, nil)
+	return BaseBundle{
+		Runner: agentLambda,
+		Name:   "ExecutorReAct-019c79ce-5c46-7600-86d8-7a9cd967a015",
+	}
+}*/
+
+func MakeIsLast(metrics *logger.Metrics) RichBundle[any, bool, PlanState] {
+	IsLast := compose.InvokableLambda(func(ctx context.Context, in any) (out bool, err error) {
+		return false, nil
+	})
+	IsLastPostHook := func(ctx context.Context, out bool, state *PlanState) (bool, error) {
+		remaining := len(state.ExecutorContexts)
+		isLast := remaining == 1
+		metrics.Emit(logger.MetricsEvent{
+			Phase: logger.PhaseExecutor,
+			Event: logger.EventLoopEnter,
+			Detail: map[string]any{
+				"remaining_steps": remaining,
+				"is_last":         isLast,
+			},
+		})
+		logger.Infof("[Executor] loop check: remaining=%d, isLast=%v", remaining, isLast)
+		if isLast {
+			return true, nil
+		}
+		return false, nil
+	}
+	return RichBundle[any, bool, PlanState]{
+		Runner:   IsLast,
+		PostHook: IsLastPostHook,
+		Name:     "IsLast-019c79fe-2cd3-772f-93f6-ecc2c556bd6a",
+	}
+}
+
+func MakeExecutor(rAgent *react.Agent, plan Plan, es *elasticsearch.Client) (string, error) {
+	ctx := context.Background()
+	metrics := logger.NewMetrics(es)
+
+	metrics.Emit(logger.MetricsEvent{
+		Phase:      logger.PhaseExecutor,
+		Event:      logger.EventPhaseStart,
+		TotalSteps: len(plan.Steps),
+		Detail:     plan,
+	})
+	executorTimer := logger.NewTimer()
+
+	if len(plan.Steps) == 0 {
+		metrics.Emit(logger.MetricsEvent{
+			Phase: logger.PhaseExecutor,
+			Event: logger.EventPhaseError,
+			Error: "plan steps is empty",
+		})
+		return "", fmt.Errorf("plan steps is empty")
+	}
+	prepareStateFunc := func(ctx context.Context) *PlanState {
+		ec := make([]ExecutorContext, len(plan.Steps))
+		for i := range ec {
+			ec[i].Step = plan.Steps[i]
+		}
+
+		ec[0].Input = "you are first executor agent, Here`s the thought of planner" + plan.Thought
+		ec[0].MainIdea = "you are first executor agent, no last main idea"
+		ec[0].OperationHistory = "you are first executor agent, no operation history"
+
+		return &PlanState{
+			Plan:             plan,
+			ExecutorContexts: ec,
+			EndOutput:        "",
+		}
+	}
+
+	pMaps, err := prompts.GetPrompts()
+	if err != nil {
+		return "", err
+	}
+
+	agentLambda, _ := compose.AnyLambda(rAgent.Generate, nil, nil, nil)
+	_ = agentLambda
+
+	// 包装 ReAct agent，添加输入/输出日志
+	reactWithLog := func(label string) *compose.Lambda {
+		wrapped := compose.InvokableLambda(func(ctx context.Context, in []*schema.Message) (*schema.Message, error) {
+			logger.Infof("[%s] input messages count: %d", label, len(in))
+			for i, msg := range in {
+				logger.Infof("[%s]   msg[%d] role=%s content=%s", label, i, msg.Role, truncateStr(msg.Content, 300))
+			}
+			timer := logger.NewTimer()
+			out, err := rAgent.Generate(ctx, in)
+			elapsed := timer.ElapsedMs()
+			if err != nil {
+				logger.Errorf("[%s] error after %dms: %v", label, elapsed, err)
+				metrics.Emit(logger.MetricsEvent{
+					Phase:      logger.PhaseExecutor,
+					Event:      logger.EventStepError,
+					DurationMs: elapsed,
+					Error:      err.Error(),
+					Detail:     map[string]string{"node": label},
+				})
+				return nil, err
+			}
+			logger.Infof("[%s] output (%dms) role=%s content=%s", label, elapsed, out.Role, truncateStr(out.Content, 500))
+			metrics.Emit(logger.MetricsEvent{
+				Phase:      logger.PhaseExecutor,
+				Event:      logger.EventStepEnd,
+				DurationMs: elapsed,
+				Detail:     map[string]string{"node": label, "content_length": fmt.Sprintf("%d", len(out.Content))},
+			})
+			return out, nil
+		})
+		return wrapped
+	}
+
+	ReAct1 := "ReAct1"
+	ReAct2 := "ReAct2"
+	react1Lambda := reactWithLog("ReAct-NormalExecutor")
+	react2Lambda := reactWithLog("ReAct-FinalExecutor")
+
+	g := compose.NewGraph[any, string](compose.WithGenLocalState(prepareStateFunc))
+
+	isLast := MakeIsLast(metrics)
+	g.AddLambdaNode(isLast.Name, isLast.Runner, compose.WithStatePostHandler(isLast.PostHook))
+
+	normalExecutor := NormalExecutor{tmplString: pMaps["normal_execulator"], metrics: metrics}
+	prepareTmplMapBundleNormal := normalExecutor.MakePrepareTmplMapBundle()
+	g.AddLambdaNode(prepareTmplMapBundleNormal.Name, prepareTmplMapBundleNormal.Runner, compose.WithStatePostHandler(prepareTmplMapBundleNormal.PostHook))
+	introduceTmplBundleNoraml := normalExecutor.IntroduceTmplBundle()
+	g.AddChatTemplateNode(introduceTmplBundleNoraml.Name, introduceTmplBundleNoraml.Tpl)
+	g.AddLambdaNode(ReAct1, react1Lambda)
+	parseToExecutorContextBundle := normalExecutor.ParseToExecutorContextBundle()
+	g.AddLambdaNode(parseToExecutorContextBundle.Name, parseToExecutorContextBundle.Runner, compose.WithStatePreHandler(parseToExecutorContextBundle.PreHook))
+
+	finalExecutor := FinalExecutor{tmpString: pMaps["final_execulator"], metrics: metrics}
+	prepareTmplMapBundleFinal := finalExecutor.MakePrepareTmplMapBundle()
+	g.AddLambdaNode(prepareTmplMapBundleFinal.Name, prepareTmplMapBundleFinal.Runner, compose.WithStatePostHandler(prepareTmplMapBundleFinal.PostHook))
+	introduceTmplBundleFinal := finalExecutor.IntroduceTmplBundle()
+	g.AddChatTemplateNode(introduceTmplBundleFinal.Name, introduceTmplBundleFinal.Tpl)
+	g.AddLambdaNode(ReAct2, react2Lambda)
+	parseToFinalBundle := finalExecutor.ParseToFinalBundle()
+	g.AddLambdaNode(parseToFinalBundle.Name, parseToFinalBundle.Runner)
+
+	condition := func(ctx context.Context, in bool) (string, error) {
+		if in {
+			return prepareTmplMapBundleFinal.Name, nil
+		}
+		return prepareTmplMapBundleNormal.Name, nil
+	}
+	branch := compose.NewGraphBranch(condition, map[string]bool{
+		prepareTmplMapBundleNormal.Name: true,
+		prepareTmplMapBundleFinal.Name:  true,
+	})
+
+	g.AddEdge(compose.START, isLast.Name)
+	g.AddBranch(isLast.Name, branch)
+
+	g.AddEdge(prepareTmplMapBundleNormal.Name, introduceTmplBundleNoraml.Name)
+	g.AddEdge(introduceTmplBundleNoraml.Name, ReAct1)
+	g.AddEdge(ReAct1, parseToExecutorContextBundle.Name)
+	g.AddEdge(parseToExecutorContextBundle.Name, isLast.Name)
+
+	g.AddEdge(prepareTmplMapBundleFinal.Name, introduceTmplBundleFinal.Name)
+	g.AddEdge(introduceTmplBundleFinal.Name, ReAct2)
+	g.AddEdge(ReAct2, parseToFinalBundle.Name)
+	g.AddEdge(parseToFinalBundle.Name, compose.END)
+
+	// 每轮循环约5个节点，支持最多20个step的plan
+	r, err := g.Compile(ctx, compose.WithMaxRunSteps(100))
+	if err != nil {
+		return "", err
+	}
+	res, err := r.Invoke(ctx, struct{}{})
+	if err != nil {
+		metrics.Emit(logger.MetricsEvent{
+			Phase:      logger.PhaseExecutor,
+			Event:      logger.EventPhaseError,
+			DurationMs: executorTimer.ElapsedMs(),
+			Error:      err.Error(),
+		})
+		return "", err
+	}
+
+	metrics.Emit(logger.MetricsEvent{
+		Phase:      logger.PhaseExecutor,
+		Event:      logger.EventPhaseEnd,
+		DurationMs: executorTimer.ElapsedMs(),
+		TotalSteps: len(plan.Steps),
+	})
+	logger.Infof("[Executor] completed in %dms", executorTimer.ElapsedMs())
+
+	return res, nil
+
+}
+
+/*func MakeExecutor(rAgent *react.Agent, plan Plan) {
+	genStateFunc := func(ctx context.Context) *testState {
+		ec := make([]ExecutorContext, len(plan.Steps))
+		ec[0] = ExecutorContext{
+			MainIdea:         "You are first executor, so theres no main idea for you",
+			OperationHistory: "You are first executor, so theres no operation history for you",
+		}
+		return &testState{
+			index:            0,
+			length:           len(plan.Steps),
+			ExecutorContexts: ec,
+		}
+	}
+
+	g := compose.NewGraph[Plan, string](compose.WithGenLocalState(genStateFunc))
+
+	// 按照index提取出一个step
+	// in Plan out []step
+	ToSingleStepBundleFunc := func() BundleWithHook[any, []Step] {
+
+		ToSingleStep := compose.InvokableLambda(func(ctx context.Context, in Plan) (out []Step, err error) {
+			return in.Steps, nil
+		})
+		ToSingleStepPostHook := func(ctx context.Context, out []Step, state *testState) ([]Step, error) {
+			if state.index >= state.length {
+				return make([]Step, 0), nil
+			}
+			newOut := out[state.index]
+			state.index++
+			return []Step{newOut}, nil
+		}
+		return BundleWithHook[any, []Step]{
+			Runner:   ToSingleStep,
+			PostHook: ToSingleStepPostHook,
+			Name:     "ToSingleStep-019c746a-9645-73d5-879c-96dfb0ce881a",
+		}
+	}
+
+	// 按照index注入ExecutorContext
+	// in []Step out ExecutorContext
+	EnrichToExecutorContextBundleFunc := func() BundleWithHook[any, ExecutorContext] {
+
+		EnrichToExecutorContext := compose.InvokableLambda(func(ctx context.Context, in []Step) (out ExecutorContext, err error) {
+			if len(in) == 0 {
+				return ExecutorContext{}, fmt.Errorf("[]step is empty")
+			}
+			return ExecutorContext{
+				Step: in[0],
+			}, nil
+		})
+		EnrichToExecutorContextPostHook := func(ctx context.Context, out ExecutorContext, state *testState) (ExecutorContext, error) {
+			ec := state.ExecutorContexts[state.index]
+			ec.Step = out.Step
+			return ec, nil
+		}
+		return BundleWithHook[any, ExecutorContext]{
+			Runner:   EnrichToExecutorContext,
+			PostHook: EnrichToExecutorContextPostHook,
+			Name:     "EnrichToExecutorContext-019c7946-d3f1-780c-83c6-6096e7c59f03",
+		}
+	}
+
+	// 组装成executor templ map
+	//
+
+	// 执行器模板
+	// in map[string]any out []*schema.Message
+	ExecutorTmplBundleFunc := func() BaseTpl {
+		tpl := prompt.FromMessages(schema.GoTemplate,
+			schema.SystemMessage("plannerPrompt"),
+			schema.UserMessage("{{.user_input}}"))
+		return BaseTpl{
+			Name: "ExecutorTmpl-019c7481-f9a0-7237-96e2-97202471f3c1",
+			Tpl:  tpl,
+		}
+	}
+
+	// 执行器react agent
+	// in []*schema.Message out *schema.Message
+	ExecutorReActAgentBundleFunc := func() BaseBundle {
+		agentLambda, _ := compose.AnyLambda(rAgent.Generate, nil, nil, nil)
+		return BaseBundle{
+			Runner: agentLambda,
+			Name:   "ExecutorReActAgent-019c7486-5e7e-7340-96f7-e0e50769424a",
+		}
+	}
+
+	ToSingleStepBundle := ToSingleStepBundleFunc()
+	_ = g.AddLambdaNode(ToSingleStepBundle.Name, ToSingleStepBundle.Runner,
+		compose.WithStatePostHandler(ToSingleStepBundle.PostHook))
+
+	ExecutorTmplBundle := ExecutorTmplBundleFunc()
+	_ = g.AddChatTemplateNode(ExecutorTmplBundle.Name, ExecutorTmplBundle.Tpl)
+
+	ExecutorReActAgentBundle := ExecutorReActAgentBundleFunc()
+	_ = g.AddLambdaNode(ExecutorTmplBundle.Name, ExecutorReActAgentBundle.Runner)
+
+}*/
