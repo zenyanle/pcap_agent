@@ -87,9 +87,9 @@ func main() {
 		MessageRewriter:  sumMW.MessageModifier,
 		ToolCallingModel: arkModel,
 		ToolsConfig: compose.ToolsNodeConfig{
-			Tools: []tool.BaseTool{bash, sre},
+			Tools: []tool.BaseTool{bash, tools.WrapToolSafe(sre)},
 		},
-		MaxStep: 200, // 复杂分析任务需要较多工具调用轮次
+		MaxStep: 200, // per-ReAct-call step cap (model call + tool call each count as 1)
 		// StreamToolCallChecker: toolCallChecker, // uncomment it to replace the default tool call checker with custom one
 	})
 	if err != nil {
@@ -102,7 +102,7 @@ func main() {
 		panic(err)
 	}
 	i, err := r.Invoke(ctx, map[string]any{
-		"user_input": "分析capture.pcapng，这个用户在学习什么内容",
+		"user_input": "Write an incident report based on malicious network activity from the pcap",
 		//"thought": "这个用户访问了哪些网站，他的意图是什么",
 	})
 	if err != nil {

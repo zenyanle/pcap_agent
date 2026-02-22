@@ -24,10 +24,11 @@ type Step struct {
 	Intent string `json:"intent"` // 这一步的意图，executor 按此开展工作
 }
 
-// Plan 是 LLM 返回的顶层结构
+// Plan is the top-level structure returned by the Planner LLM.
 type Plan struct {
-	Thought string `json:"thought"` // LLM 的推理过程（思维链）
-	Steps   []Step `json:"steps"`   // 执行步骤列表
+	Thought     string `json:"thought"`      // LLM chain-of-thought reasoning
+	TableSchema string `json:"table_schema"` // Verbatim output of pcapchu-scripts meta
+	Steps       []Step `json:"steps"`        // Ordered execution steps
 }
 
 func ExtractJSON(input string) (string, error) {
@@ -84,6 +85,42 @@ func MakePlanner(rAgent *react.Agent, es *elasticsearch.Client) (compose.Runnabl
 		schema.UserMessage("{{.user_input}}"))
 
 	agentLambda, _ := compose.AnyLambda(rAgent.Generate, nil, nil, nil)
+	_ = agentLambda
+
+	// Planner ReAct with callback logging
+	plannerReActLambda := compose.InvokableLambda(func(ctx context.Context, in []*schema.Message) (*schema.Message, error) {
+		logger.Infof("[Planner-ReAct] input messages count: %d", len(in))
+		cb := &logger.PrettyLoggerCallback{Es: es}
+		timer := logger.NewTimer()
+		out, err := rAgent.Generate(ctx, in,
+			agent.WithComposeOptions(compose.WithCallbacks(cb)),
+		)
+		elapsed := timer.ElapsedMs()
+		if err != nil {
+			logger.Errorf("[Planner-ReAct] error after %dms: %v", elapsed, err)
+			metrics.Emit(logger.MetricsEvent{
+				LogType:    logger.LTPlannerError,
+				Phase:      logger.PhasePlanner,
+				Event:      logger.EventPhaseError,
+				DurationMs: elapsed,
+				Error:      err.Error(),
+			})
+			return nil, err
+		}
+		logger.Infof("[Planner-ReAct] output (%dms) callback_events=%d content=%s",
+			elapsed, cb.Step, truncateStr(out.Content, 500))
+		metrics.Emit(logger.MetricsEvent{
+			LogType:    logger.LTPlannerRawOutput,
+			Phase:      logger.PhasePlanner,
+			Event:      "react_complete",
+			DurationMs: elapsed,
+			Output: map[string]any{
+				"callback_steps": cb.Step,
+				"content_length": len(out.Content),
+			},
+		})
+		return out, nil
+	})
 
 	nodeOfPrompt := "prompt"
 	nodeOfReAct := "ReAct"
@@ -92,16 +129,8 @@ func MakePlanner(rAgent *react.Agent, es *elasticsearch.Client) (compose.Runnabl
 	g := compose.NewGraph[map[string]any, Plan]()
 
 	_ = g.AddChatTemplateNode(nodeOfPrompt, tpl)
-	_ = g.AddLambdaNode(nodeOfReAct, agentLambda)
+	_ = g.AddLambdaNode(nodeOfReAct, plannerReActLambda)
 	_ = g.AddLambdaNode(nodeOfParse, compose.InvokableLambda(func(ctx context.Context, input *schema.Message) (Plan, error) {
-		// 上报 ReAct 原始输出
-		metrics.Emit(logger.MetricsEvent{
-			LogType: logger.LTPlannerRawOutput,
-			Phase:   logger.PhasePlanner,
-			Event:   "react_output",
-			Output:  map[string]string{"role": string(input.Role), "content": truncateStr(input.Content, 2000)},
-		})
-
 		var plan Plan
 		str, err := ExtractJSON(input.Content)
 		if err != nil {
@@ -237,9 +266,10 @@ type RichBundle[I any, O any, S any] struct {
 
 type PlanState struct {
 	Plan             Plan
-	CurrentStepIndex int      // 当前执行到第几步 (0-based)
-	ResearchFindings string   // 累积的研究发现报告，各 agent 主动贡献
-	OperationLog     []string // 追加式操作日志，每个 executor 只记录自己的动作
+	TableSchema      string   // Cached pcapchu-scripts meta output, injected into executor prompts
+	CurrentStepIndex int      // 0-based index of the current step
+	ResearchFindings string   // Cumulative research findings contributed by each executor
+	OperationLog     []string // Append-only operation log, one entry per executor
 	EndOutput        string
 }
 
@@ -327,6 +357,7 @@ func (n *NormalExecutor) MakePrepareTmplMapBundle() RichBundle[any, map[string]a
 			"research_findings": findings,
 			"operation_log":     opLog,
 			"current_step":      fmt.Sprintf("Step %d: %s", step.StepID, step.Intent),
+			"table_schema":      state.TableSchema,
 		}
 
 		// 上报 step 开始 + 模板注入数据
@@ -486,6 +517,7 @@ func (f *FinalExecutor) MakePrepareTmplMapBundle() RichBundle[any, map[string]an
 			"plan_overview":     planOverview,
 			"research_findings": findings,
 			"operation_log":     opLog,
+			"table_schema":      state.TableSchema,
 		}
 
 		// 上报 final step 开始 + 输入数据
@@ -604,8 +636,13 @@ func MakeExecutor(rAgent *react.Agent, plan Plan, es *elasticsearch.Client) (str
 		return "", fmt.Errorf("plan steps is empty")
 	}
 	prepareStateFunc := func(ctx context.Context) *PlanState {
+		tableSchema := plan.TableSchema
+		if tableSchema == "" {
+			tableSchema = "(Table schema not available — run `pcapchu-scripts meta` if needed)"
+		}
 		return &PlanState{
 			Plan:             plan,
+			TableSchema:      tableSchema,
 			CurrentStepIndex: 0,
 			ResearchFindings: "",
 			OperationLog:     []string{},
