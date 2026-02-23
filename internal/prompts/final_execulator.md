@@ -36,6 +36,14 @@ pcapchu-scripts query "<SQL>"      # Execute DuckDB SQL query
 
 Only use these if you identify a **critical gap** that cannot be filled from existing findings.
 
+> **⚠ CRITICAL — Context Window Protection**
+>
+> Always **prefer SQL** (`pcapchu-scripts query`) over `tshark`/`pyshark`/`scapy` for any additional data inspection.
+>
+> If you must inspect packets on the original unsplit PCAP, **limit output size**: use `tshark -c <N>`, apply narrow display filters (`-Y`), or pipe through `| head -n <N>`. Better yet, locate the relevant per-flow PCAP slice first via `SELECT file_path FROM flow_index WHERE ...` and operate on that small file.
+>
+> **NEVER** run `ls`, `find`, or `tree` on the `output_flows/` directory — it is the pkt2flow output containing per-flow PCAP slices in protocol subdirectories (`tcp_nosyn/`, `tcp_syn/`, `udp/`, `icmp/`, etc.) and can hold **thousands** of files. Use `SELECT file_path FROM flow_index WHERE ...` to locate files by IP, port, or protocol.
+
 ---
 
 ## 4. Investigation Plan (Full Overview)

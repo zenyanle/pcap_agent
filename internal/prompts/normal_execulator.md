@@ -61,6 +61,20 @@ cap = pyshark.FileCapture('input.pcap', display_filter='http')
 - Always use **absolute paths** (e.g., `/home/linuxbrew/pcaps/capture.pcap`).
 - The `flow_index` table maps Zeek metadata to raw PCAP slices — join on IPs/ports if needed.
 
+> **⚠ CRITICAL — Context Window Protection**
+>
+> Always **prefer SQL** (`pcapchu-scripts query`) over `tshark`/`pyshark`/`scapy` for data inspection. SQL queries return structured, bounded results and do not risk flooding the context window.
+>
+> If you genuinely need packet-level inspection on the original unsplit PCAP (e.g., TCP stream reassembly, binary payload extraction), you **MUST limit output size**:
+> - `tshark -c <N>` — cap the number of packets read.
+> - `tshark -Y "<narrow_filter>"` — apply a tight display filter.
+> - Pipe through `| head -n <N>` or `| tail -n <N>` — truncate output.
+> - In Python, iterate only a bounded number of packets (e.g., `for i, pkt in enumerate(cap): if i >= 100: break`).
+>
+> **Preferred approach:** Use SQL to locate the relevant per-flow PCAP slice first (`SELECT file_path FROM flow_index WHERE ...`), then run tools on that small file instead of the original.
+>
+> **NEVER** run `ls`, `find`, or `tree` on the `output_flows/` directory. This directory is created by pkt2flow and contains per-flow PCAP slices organized into subdirectories by protocol (`tcp_nosyn/`, `tcp_syn/`, `udp/`, `icmp/`, etc.), with filenames encoding the 5-tuple. It can contain **thousands** of files, and listing it will flood the context window. Always use `SELECT file_path FROM flow_index WHERE ...` to locate specific files by IP, port, or protocol.
+
 ---
 
 ## 4. Investigation Plan (Full Overview)
