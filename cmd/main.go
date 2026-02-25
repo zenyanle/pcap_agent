@@ -8,8 +8,11 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"pcap_agent/internal/events"
@@ -63,22 +66,47 @@ func main() {
 	if err != nil {
 		log.Fatalf("create sandbox operator: %v", err)
 	}
-	defer func() {
-		if entity, ok := op.(*sandbox.DockerSandbox); ok {
-			entity.Cleanup(ctx)
-		}
+
+	// Cleanup — safe to call multiple times via sync.Once.
+	var cleanupOnce sync.Once
+	cleanup := func() {
+		cleanupOnce.Do(func() {
+			if entity, ok := op.(*sandbox.DockerSandbox); ok {
+				fmt.Println("Cleaning up Docker container...")
+				entity.Cleanup(ctx)
+			}
+		})
+	}
+	defer cleanup()
+
+	// Catch SIGINT / SIGTERM so Ctrl+C also cleans up the container.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		sig := <-sigCh
+		fmt.Printf("\nReceived %v, cleaning up container...\n", sig)
+		cleanup()
+		os.Exit(130)
 	}()
+
+	// fatal logs an error, cleans up the container, and exits.
+	// Use this instead of log.Fatalf after sandbox creation.
+	fatal := func(format string, args ...any) {
+		log.Printf(format, args...)
+		cleanup()
+		os.Exit(1)
+	}
 
 	// --- Copy PCAP into container (if starting new session) ---
 	var containerPcapPath string
 	if *pcapFlag != "" {
 		dockerSandbox, ok := op.(*sandbox.DockerSandbox)
 		if !ok {
-			log.Fatalf("operator is not DockerSandbox, cannot copy PCAP")
+			fatal("operator is not DockerSandbox, cannot copy PCAP")
 		}
 		containerPcapPath = "/home/linuxbrew/pcaps/" + filepath.Base(*pcapFlag)
 		if err := virtual_env.CopyFileToContainer(ctx, dockerSandbox, *pcapFlag, containerPcapPath); err != nil {
-			log.Fatalf("copy pcap to container: %v", err)
+			fatal("copy pcap to container: %v", err)
 		}
 		fmt.Printf("Copied %s → container:%s\n", *pcapFlag, containerPcapPath)
 	}
@@ -94,14 +122,14 @@ func main() {
 		BaseURL: arkBaseUrl,
 	})
 	if err != nil {
-		log.Fatalf("create chat model: %v", err)
+		fatal("create chat model: %v", err)
 	}
 
 	// --- Tools ---
 	bash := tools.NewBashTool(op)
 	sre, err := commandline.NewStrReplaceEditor(ctx, &commandline.EditorConfig{Operator: op})
 	if err != nil {
-		log.Fatalf("create str_replace_editor: %v", err)
+		fatal("create str_replace_editor: %v", err)
 	}
 
 	// --- Summarization middleware ---
@@ -111,7 +139,7 @@ func main() {
 		MaxTokensForRecentMessages: 20 * 1024,
 	})
 	if err != nil {
-		log.Fatalf("create summarization middleware: %v", err)
+		fatal("create summarization middleware: %v", err)
 	}
 
 	// --- ReAct agent ---
@@ -124,13 +152,13 @@ func main() {
 		MaxStep: 200,
 	})
 	if err != nil {
-		log.Fatalf("create react agent: %v", err)
+		fatal("create react agent: %v", err)
 	}
 
 	// --- Planner & Executor ---
 	p, err := planner.NewPlanner(ctx, rAgent, emitter)
 	if err != nil {
-		log.Fatalf("create planner: %v", err)
+		fatal("create planner: %v", err)
 	}
 	exec := executor.NewExecutor(rAgent, emitter)
 
@@ -139,17 +167,17 @@ func main() {
 	if *sessionID != "" {
 		sess, err = session.ResumeSession(store, emitter, *sessionID)
 		if err != nil {
-			log.Fatalf("resume session %s: %v", *sessionID, err)
+			fatal("resume session %s: %v", *sessionID, err)
 		}
 		containerPcapPath = sess.PcapPath // use the stored container path
 		fmt.Printf("Resumed session %s (pcap: %s, round: %d)\n", sess.ID, sess.PcapPath, sess.RoundNum)
 	} else {
 		if *pcapFlag == "" {
-			log.Fatalf("--pcap is required for new sessions")
+			fatal("--pcap is required for new sessions")
 		}
 		sess, err = session.NewSession(store, emitter, containerPcapPath)
 		if err != nil {
-			log.Fatalf("create session: %v", err)
+			fatal("create session: %v", err)
 		}
 		fmt.Printf("New session %s (pcap: %s)\n", sess.ID, sess.PcapPath)
 	}
