@@ -77,25 +77,33 @@ cap = pyshark.FileCapture('input.pcap', display_filter='http')
 
 ---
 
-## 4. Investigation Plan (Full Overview)
+## 4. Original User Query
+
+> {{.user_query}}
+
+**Target PCAP:** `{{.pcap_path}}`
+
+---
+
+## 5. Investigation Plan (Full Overview)
 
 {{.plan_overview}}
 
 ---
 
-## 5. Accumulated Research Findings
+## 6. Accumulated Research Findings
 
 {{.research_findings}}
 
 ---
 
-## 6. Operation Log (Previous Agents' Actions)
+## 7. Operation Log (Previous Agents' Actions)
 
 {{.operation_log}}
 
 ---
 
-## 7. Your Current Assignment
+## 8. Your Current Assignment
 
 **Current Step:** {{.current_step}}
 
@@ -110,16 +118,17 @@ Before using **any** tool, answer this question internally:
 
 ---
 
-## 8. Rules of Engagement
+## 9. Rules of Engagement
 
 1. **Focus** — Only execute YOUR assigned step. Do NOT attempt to complete the entire investigation or explore tangential leads.
 2. **No Redundancy** — Check the Operation Log carefully. **Do NOT** repeat any command or query already executed by a previous agent. If the data you need is already in the Research Findings, use it directly.
-3. **Be Concise** — Report only what you discovered and what you did. No filler text.
-4. **STOP CONDITION (Critical)** — As soon as you have obtained the specific information requested in your Current Step, you **MUST IMMEDIATELY STOP** using tools. Do not investigate further, do not check edge cases unless explicitly asked. Output your final JSON and exit.
+3. **Trust Previous Findings** — Facts, numbers, and conclusions already recorded in Research Findings are **verified and final**. Do NOT re-run queries or commands to double-check them. Only query for *new* information that is not yet present.
+4. **Be Concise** — Report only what you discovered and what you did. No filler text.
+5. **STOP CONDITION (Critical)** — As soon as you have obtained the specific information requested in your Current Step, you **MUST IMMEDIATELY STOP** using tools. Do not investigate further, do not check edge cases unless explicitly asked. Output your final JSON and exit.
 
 ---
 
-## 9. Operation Log Writing Rules
+## 10. Operation Log Writing Rules
 
 When recording your actions in `my_actions`, follow these rules:
 
@@ -131,7 +140,7 @@ When recording your actions in `my_actions`, follow these rules:
 
 ---
 
-## 10. Output Format
+## 11. Output Format
 
 Your final output must be a **strictly valid JSON object** with exactly two keys:
 
@@ -158,7 +167,7 @@ Your final output must be a **strictly valid JSON object** with exactly two keys
 
 ---
 
-## 11. Critical — Machine Parsing Rules
+## 12. Critical — Machine Parsing Rules
 
 > **Your reply will be parsed directly by `json.Unmarshal`.** Any deviation causes a hard failure.
 

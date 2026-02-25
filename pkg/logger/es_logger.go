@@ -18,6 +18,10 @@ type WrapperStruct struct {
 }
 
 func SendWrappedLog(client *elasticsearch.Client, streamName string, logType string, rawData interface{}) error {
+	if client == nil {
+		return nil
+	}
+
 	payload := WrapperStruct{
 		LogType:   logType,
 		Timestamp: time.Now(),

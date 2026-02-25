@@ -1,72 +1,67 @@
-/*
- * Copyright 2024 CloudWeGo Authors
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
 package main
 
 import (
+	"bufio"
 	"context"
-	"github.com/elastic/go-elasticsearch/v7"
+	"encoding/json"
+	"flag"
+	"fmt"
 	"log"
 	"os"
-	"pcap_agent/internal/prompts"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"pcap_agent/internal/events"
+	"pcap_agent/internal/executor"
+	"pcap_agent/internal/planner"
+	"pcap_agent/internal/session"
 	conversationsummary "pcap_agent/internal/summary"
 	"pcap_agent/internal/tools"
 	"pcap_agent/internal/virtual_env"
-	"time"
-
-	"github.com/cloudwego/eino-ext/components/tool/commandline"
-	"github.com/cloudwego/eino-ext/components/tool/commandline/sandbox"
-
 	"pcap_agent/pkg/logger"
 
 	"github.com/cloudwego/eino-ext/components/model/openai"
+	"github.com/cloudwego/eino-ext/components/tool/commandline"
+	"github.com/cloudwego/eino-ext/components/tool/commandline/sandbox"
 
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/compose"
-	"github.com/cloudwego/eino/flow/agent"
 	"github.com/cloudwego/eino/flow/agent/react"
-	"github.com/cloudwego/eino/schema"
 )
 
 func main() {
+	// --- Flags ---
+	pcapFlag := flag.String("pcap", "", "Local PCAP file path (required for new session)")
+	sessionID := flag.String("session", "", "Resume an existing session by ID")
+	dbPath := flag.String("db", "pcap_agent.db", "SQLite database path")
+	flag.Parse()
 
 	ctx := context.Background()
 
-	// 加载 prompts
-	promptMap, err := prompts.GetPrompts()
+	// --- SQLite store ---
+	store, err := session.OpenStore(*dbPath)
 	if err != nil {
-		logger.Fatalf("failed to load prompts: %v", err)
+		log.Fatalf("open store: %v", err)
 	}
+	defer store.Close()
 
-	cfg := elasticsearch.Config{
-		Addresses: []string{
-			"http://localhost:5080/api/default",
-		},
-		Username: "root@example.com",
-		Password: "Complexpass#123",
-	}
+	// --- Event system ---
+	emitter := events.NewChannelEmitter(512)
+	defer emitter.Close()
 
-	esClient, err := elasticsearch.NewClient(cfg)
-	if err != nil {
-		log.Fatalf("创建客户端失败: %s", err)
-	}
+	// Event printer goroutine (CLI consumer)
+	go func() {
+		ch := emitter.Subscribe()
+		for ev := range ch {
+			printEvent(ev)
+		}
+	}()
 
+	// --- Docker sandbox ---
 	op, err := virtual_env.GetOperator(ctx)
 	if err != nil {
-		logger.Fatalf("op create errot")
+		log.Fatalf("create sandbox operator: %v", err)
 	}
 	defer func() {
 		if entity, ok := op.(*sandbox.DockerSandbox); ok {
@@ -74,106 +69,180 @@ func main() {
 		}
 	}()
 
-	/*	out, err := op.RunCommand(ctx, []string{"bash", "-c", "pcapchu-scripts init /home/linuxbrew/pcaps/test.pcapng"})
-		if err != nil {
-			logger.Fatalf("init error", err)
+	// --- Copy PCAP into container (if starting new session) ---
+	var containerPcapPath string
+	if *pcapFlag != "" {
+		dockerSandbox, ok := op.(*sandbox.DockerSandbox)
+		if !ok {
+			log.Fatalf("operator is not DockerSandbox, cannot copy PCAP")
 		}
-		if out.ExitCode != 0 {
-			logger.Warnf("init error", out.Stdout, out.ExitCode)
-		}*/
+		containerPcapPath = "/home/linuxbrew/pcaps/" + filepath.Base(*pcapFlag)
+		if err := virtual_env.CopyFileToContainer(ctx, dockerSandbox, *pcapFlag, containerPcapPath); err != nil {
+			log.Fatalf("copy pcap to container: %v", err)
+		}
+		fmt.Printf("Copied %s → container:%s\n", *pcapFlag, containerPcapPath)
+	}
 
+	// --- LLM ---
 	arkApiKey := os.Getenv("ARK_API_KEY")
 	arkModelName := os.Getenv("ARK_MODEL_NAME")
 	arkBaseUrl := os.Getenv("ARK_BASE_URL")
 
-	config := &openai.ChatModelConfig{
+	arkModel, err := openai.NewChatModel(ctx, &openai.ChatModelConfig{
 		APIKey:  arkApiKey,
 		Model:   arkModelName,
 		BaseURL: arkBaseUrl,
-	}
-	arkModel, err := openai.NewChatModel(ctx, config)
-	if err != nil {
-		logger.Errorf("failed to create chat model: %v", err)
-		return
-	}
-
-	bash := tools.NewBashTool(op)
-
-	sre, err := commandline.NewStrReplaceEditor(ctx, &commandline.EditorConfig{Operator: op})
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	sumMW, err := conversationsummary.New(ctx, &conversationsummary.Config{
-		Model:                      arkModel,
-		MaxTokensBeforeSummary:     300 * 1024, // Trigger at 10K tokens for demo
-		MaxTokensForRecentMessages: 4 * 1024,   // Keep 2K tokens of recent messages
 	})
 	if err != nil {
-		logger.Fatalf("create summarization middleware failed, err=%v", err)
+		log.Fatalf("create chat model: %v", err)
 	}
 
+	// --- Tools ---
+	bash := tools.NewBashTool(op)
+	sre, err := commandline.NewStrReplaceEditor(ctx, &commandline.EditorConfig{Operator: op})
+	if err != nil {
+		log.Fatalf("create str_replace_editor: %v", err)
+	}
+
+	// --- Summarization middleware ---
+	sumMW, err := conversationsummary.New(ctx, &conversationsummary.Config{
+		Model:                      arkModel,
+		MaxTokensBeforeSummary:     64 * 1024,
+		MaxTokensForRecentMessages: 20 * 1024,
+	})
+	if err != nil {
+		log.Fatalf("create summarization middleware: %v", err)
+	}
+
+	// --- ReAct agent ---
 	rAgent, err := react.NewAgent(ctx, &react.AgentConfig{
 		MessageRewriter:  sumMW.MessageModifier,
 		ToolCallingModel: arkModel,
 		ToolsConfig: compose.ToolsNodeConfig{
-			Tools: []tool.BaseTool{bash, sre},
+			Tools: []tool.BaseTool{bash, tools.WrapToolSafe(sre)},
 		},
-		MaxStep: 200, // 增加最大步数限制，默认通常是 10-15
-		// StreamToolCallChecker: toolCallChecker, // uncomment it to replace the default tool call checker with custom one
+		MaxStep: 200,
 	})
 	if err != nil {
-		logger.Errorf("failed to create agent: %v", err)
-		return
+		log.Fatalf("create react agent: %v", err)
 	}
 
-	// if you want ping/pong, use Generate
-	// msg, err := agent.Generate(ctx, []*schema.Message{
-	// 	{
-	// 		Role:    schema.User,
-	// 		Content: "我在北京，给我推荐一些菜，需要有口味辣一点的菜，至少推荐有 2 家餐厅",
-	// 	},
-	// }, react.WithCallbacks(&myCallback{}))
-	// if err != nil {
-	// 	log.Printf("failed to generate: %v\n", err)
-	// 	return
-	// }
-	// fmt.Println(msg.String())
-
-	opt := []agent.AgentOption{
-		//agent.WithComposeOptions(compose.WithCallbacks(&logger.LoggerCallback{Es: esClient})), // 使用美观的 logger
-		agent.WithComposeOptions(compose.WithCallbacks(&logger.PrettyLoggerCallback{Es: esClient})), // 原始 logger
-	}
-
-	/*	// Export graph and compile with mermaid (non-critical path)
-		anyG	{
-				anyG, opts := rAgent.ExportGraph()
-				gen := visualize.NewMermaidGenerator("flow/agent/react")
-				g := compose.NewGraph[[]*schema.Message, *schema.Message]()
-				_ = g.AddGraphNode("react_agent", anyG, opts...)
-				_ = g.AddEdge(compose.START, "react_agent")
-				_ = g.AddEdge("react_agent", compose.END)
-				_, _ = g.Compile(context.Background(), compose.WithGraphCompileCallbacks(gen))
-			}*/
-
-	// 使用 Generate 方法确保工具调用被正确执行（而不是流式处理）
-	// 流式处理可能导致工具调用参数不完整
-	msg, err := rAgent.Generate(ctx, []*schema.Message{
-		{
-			Role:    schema.System,
-			Content: promptMap["analyzer_introduction"],
-		},
-		{
-			Role:    schema.User,
-			Content: "你是一个高级网络分析师，分析/home/linuxbrew/pcaps/目录下的文件，研究这个用户访问了什么网站，在网站里面执行了什么操作",
-		},
-	}, opt...)
+	// --- Planner & Executor ---
+	p, err := planner.NewPlanner(ctx, rAgent, emitter)
 	if err != nil {
-		logger.Errorf("failed to generate: %v", err)
-		return
+		log.Fatalf("create planner: %v", err)
+	}
+	exec := executor.NewExecutor(rAgent, emitter)
+
+	// --- Session ---
+	var sess *session.Session
+	if *sessionID != "" {
+		sess, err = session.ResumeSession(store, emitter, *sessionID)
+		if err != nil {
+			log.Fatalf("resume session %s: %v", *sessionID, err)
+		}
+		containerPcapPath = sess.PcapPath // use the stored container path
+		fmt.Printf("Resumed session %s (pcap: %s, round: %d)\n", sess.ID, sess.PcapPath, sess.RoundNum)
+	} else {
+		if *pcapFlag == "" {
+			log.Fatalf("--pcap is required for new sessions")
+		}
+		sess, err = session.NewSession(store, emitter, containerPcapPath)
+		if err != nil {
+			log.Fatalf("create session: %v", err)
+		}
+		fmt.Printf("New session %s (pcap: %s)\n", sess.ID, sess.PcapPath)
 	}
 
-	logger.Infof("\n\n===== result =====\n\n")
-	logger.Infof("%s\n", msg.Content)
-	time.Sleep(2 * time.Second)
+	// --- REPL ---
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+
+	fmt.Println("\nPCAP Analysis Agent - Multi-turn REPL")
+	fmt.Println("Type your query and press Enter. Type 'quit' or 'exit' to stop.\n")
+
+	for {
+		fmt.Printf("[round %d] > ", sess.RoundNum+1)
+		if !scanner.Scan() {
+			break
+		}
+		query := strings.TrimSpace(scanner.Text())
+		if query == "" {
+			continue
+		}
+		if query == "quit" || query == "exit" {
+			fmt.Println("Goodbye.")
+			break
+		}
+
+		// Load session history for multi-round context
+		history, err := sess.History()
+		if err != nil {
+			logger.Errorf("load session history: %v", err)
+		}
+
+		// --- Plan ---
+		fmt.Println("\n--- Planning ---")
+		plan, err := p.Run(ctx, planner.PlannerInput{
+			UserQuery: query,
+			PcapPath:  containerPcapPath,
+			History:   history,
+		})
+		if err != nil {
+			logger.Errorf("planner failed: %v", err)
+			fmt.Printf("Planner error: %v\n\n", err)
+			continue
+		}
+
+		fmt.Printf("\nPlan: %d steps\n", len(plan.Steps))
+		for _, s := range plan.Steps {
+			fmt.Printf("  Step %d: %s\n", s.StepID, s.Intent)
+		}
+
+		// --- Execute ---
+		fmt.Println("\n--- Executing ---")
+		result, err := exec.Run(ctx, plan, query, containerPcapPath)
+		if err != nil {
+			logger.Errorf("executor failed: %v", err)
+			fmt.Printf("Executor error: %v\n\n", err)
+			continue
+		}
+
+		// --- Save round ---
+		if err := sess.SaveRound(query, plan, result.Report, result.Findings, result.OperationLog); err != nil {
+			logger.Errorf("save round: %v", err)
+		}
+
+		// --- Print report ---
+		fmt.Println("\n===== REPORT =====")
+		fmt.Println(result.Report)
+		fmt.Println("==================\n")
+	}
+
+	// Allow events to flush
+	time.Sleep(500 * time.Millisecond)
+}
+
+// printEvent formats and prints an event to the terminal.
+func printEvent(ev events.Event) {
+	switch ev.Type {
+	case events.TypePlanCreated:
+		fmt.Printf("[EVENT] Plan created\n")
+	case events.TypeStepStarted:
+		var d events.StepStartedData
+		_ = json.Unmarshal(ev.Data, &d)
+		fmt.Printf("[EVENT] Step %d/%d started: %s\n", d.StepID, d.TotalSteps, d.Intent)
+	case events.TypeStepFindings:
+		fmt.Printf("[EVENT] Step findings captured\n")
+	case events.TypeStepError:
+		var d events.ErrorData
+		_ = json.Unmarshal(ev.Data, &d)
+		fmt.Printf("[EVENT] Step error: %s\n", d.Message)
+	case events.TypeReportGenerated:
+		fmt.Printf("[EVENT] Report generated\n")
+	case events.TypeError:
+		var d events.ErrorData
+		_ = json.Unmarshal(ev.Data, &d)
+		fmt.Printf("[EVENT] Error (%s): %s\n", d.Phase, d.Message)
+	}
 }

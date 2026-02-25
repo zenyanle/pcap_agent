@@ -20,7 +20,9 @@ import (
 	"github.com/elastic/go-elasticsearch/v7"
 )
 
-func main() {
+// testMain is the legacy single-shot planner→executor demo using the orche package.
+// To use it, call testMain() from main() instead of the REPL.
+func testMain() {
 	ctx := context.Background()
 
 	// ES client
@@ -76,8 +78,8 @@ func main() {
 
 	sumMW, err := conversationsummary.New(ctx, &conversationsummary.Config{
 		Model:                      arkModel,
-		MaxTokensBeforeSummary:     32 * 1024, // 32K tokens 时触发摘要压缩，防止内存膨胀
-		MaxTokensForRecentMessages: 4 * 1024,  // 保留最近 4K tokens 的原始消息
+		MaxTokensBeforeSummary:     64 * 1024, // 32K tokens 时触发摘要压缩，防止内存膨胀
+		MaxTokensForRecentMessages: 20 * 1024, // 保留最近 4K tokens 的原始消息
 	})
 	if err != nil {
 		logger.Fatalf("create summarization middleware failed, err=%v", err)
@@ -102,7 +104,7 @@ func main() {
 		panic(err)
 	}
 	i, err := r.Invoke(ctx, map[string]any{
-		"user_input": "Write an incident report based on malicious network activity from the pcap",
+		"user_input": "analyze capture.pcapng, which is from a ctf puzzle",
 		//"thought": "这个用户访问了哪些网站，他的意图是什么",
 	})
 	if err != nil {
